@@ -3,6 +3,7 @@ package recorder
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"time"
 )
@@ -28,6 +29,33 @@ func createSessionFile() (*os.File, string, error) {
 	}
 
 	return file, filepath, nil
+}
+
+// setupShellCommand creates a transparent sub-shell command using the user's default shell
+// that inherits the current environment and working directory
+func setupShellCommand() (*exec.Cmd, error) {
+	// Get current working directory
+	cwd, err := os.Getwd()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get current directory: %w", err)
+	}
+
+	// Get user's default shell from SHELL environment variable
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		shell = "/bin/bash" // fallback to bash if SHELL is not set
+	}
+
+	// Create shell command with -l (login) flag to load user's configuration
+	cmd := exec.Command(shell, "-l")
+
+	// Copy all environment variables to make sub-shell transparent
+	cmd.Env = os.Environ()
+
+	// Set working directory to preserve user's location
+	cmd.Dir = cwd
+
+	return cmd, nil
 }
 
 // StartRecording starts a new recording session
