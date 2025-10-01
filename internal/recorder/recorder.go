@@ -6,6 +6,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"time"
+
+	"github.com/creack/pty"
+	"golang.org/x/term"
 )
 
 // createSessionFile creates a new session file with timestamp-based naming
@@ -56,6 +59,36 @@ func setupShellCommand() (*exec.Cmd, error) {
 	cmd.Dir = cwd
 
 	return cmd, nil
+}
+
+// startPTY starts the command with a PTY and returns the PTY master file handle
+func startPTY(cmd *exec.Cmd) (*os.File, error) {
+	// Start the command with PTY
+	ptmx, err := pty.Start(cmd)
+	if err != nil {
+		return nil, fmt.Errorf("failed to start PTY: %w", err)
+	}
+
+	return ptmx, nil
+}
+
+// configureTerminal sets the terminal to raw mode and inherits the terminal size
+// Returns the original terminal state for restoration on exit
+func configureTerminal(ptmx *os.File) (*term.State, error) {
+	// Set stdin to raw mode to pass all input directly to PTY
+	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+	if err != nil {
+		return nil, fmt.Errorf("failed to set terminal to raw mode: %w", err)
+	}
+
+	// Copy current terminal size to PTY to ensure proper display
+	if err := pty.InheritSize(os.Stdin, ptmx); err != nil {
+		// Restore terminal state before returning error
+		term.Restore(int(os.Stdin.Fd()), oldState)
+		return nil, fmt.Errorf("failed to inherit terminal size: %w", err)
+	}
+
+	return oldState, nil
 }
 
 // StartRecording starts a new recording session
