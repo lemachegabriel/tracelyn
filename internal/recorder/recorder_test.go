@@ -11,7 +11,7 @@ func TestCreateSessionFile(t *testing.T) {
 	// Clean up any existing sessions directory
 	defer os.RemoveAll("sessions")
 
-	file, path, err := createSessionFile()
+	file, path, err := CreateSessionFile()
 	if err != nil {
 		t.Fatalf("createSessionFile() failed: %v", err)
 	}

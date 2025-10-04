@@ -4,16 +4,19 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 	"time"
 
+	"github.com/charmbracelet/x/vt"
 	"github.com/creack/pty"
 	"golang.org/x/term"
 )
 
-// createSessionFile creates a new session file with timestamp-based naming
+// CreateSessionFile creates a new session file with timestamp-based naming
 // Returns the file handle, filename, and any error
-func createSessionFile() (*os.File, string, error) {
+func CreateSessionFile() (*os.File, string, error) {
 	// Ensure sessions directory exists
 	sessionsDir := "sessions"
 	if err := os.MkdirAll(sessionsDir, 0755); err != nil {
@@ -34,9 +37,9 @@ func createSessionFile() (*os.File, string, error) {
 	return file, filepath, nil
 }
 
-// setupShellCommand creates a transparent sub-shell command using the user's default shell
+// SetupShellCommand creates a transparent sub-shell command using the user's default shell
 // that inherits the current environment and working directory
-func setupShellCommand() (*exec.Cmd, error) {
+func SetupShellCommand() (*exec.Cmd, error) {
 	// Get current working directory
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -61,8 +64,8 @@ func setupShellCommand() (*exec.Cmd, error) {
 	return cmd, nil
 }
 
-// startPTY starts the command with a PTY and returns the PTY master file handle
-func startPTY(cmd *exec.Cmd) (*os.File, error) {
+// StartPTY starts the command with a PTY and returns the PTY master file handle
+func StartPTY(cmd *exec.Cmd) (*os.File, error) {
 	// Start the command with PTY
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
@@ -72,9 +75,9 @@ func startPTY(cmd *exec.Cmd) (*os.File, error) {
 	return ptmx, nil
 }
 
-// configureTerminal sets the terminal to raw mode and inherits the terminal size
+// ConfigureTerminal sets the terminal to raw mode and inherits the terminal size
 // Returns the original terminal state for restoration on exit
-func configureTerminal(ptmx *os.File) (*term.State, error) {
+func ConfigureTerminal(ptmx *os.File) (*term.State, error) {
 	// Set stdin to raw mode to pass all input directly to PTY
 	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
 	if err != nil {
@@ -89,6 +92,168 @@ func configureTerminal(ptmx *os.File) (*term.State, error) {
 	}
 
 	return oldState, nil
+}
+
+// HandleResize listens for SIGWINCH (window resize) signals and updates the PTY size accordingly
+// Returns the signal channel for cleanup
+func HandleResize(ptmx *os.File) chan os.Signal {
+	// Create channel to receive window resize signals
+	resizeCh := make(chan os.Signal, 1)
+	signal.Notify(resizeCh, syscall.SIGWINCH)
+
+	// Start goroutine to handle resize events
+	go func() {
+		for range resizeCh {
+			// Update PTY size to match current terminal size
+			if err := pty.InheritSize(os.Stdin, ptmx); err != nil {
+				// Silently ignore resize errors to avoid disrupting the session
+				// The terminal will continue working, just with the old size
+				continue
+			}
+		}
+	}()
+
+	return resizeCh
+}
+
+// captureState represents the current state of the recording session
+type captureState int
+
+const (
+	waitingForEnter  captureState = iota // Waiting for user to press Enter
+	waitingForOutput                     // Waiting for command output to complete
+)
+
+// extractLine gets a single line from the emulator, trimmed
+func extractLine(emulator *vt.Emulator, y int) string {
+	var line string
+	width := emulator.Width()
+
+	for x := 0; x < width; x++ {
+		cell := emulator.CellAt(x, y)
+		if cell != nil && cell.Content != "" {
+			line += cell.Content
+		}
+	}
+
+	return trimRight(line)
+}
+
+// saveNewContent extracts and saves only new lines from the virtual terminal
+// Uses line-by-line tracking to avoid duplicates
+func saveNewContent(emulator *vt.Emulator, file *os.File, savedLines *[]string) error {
+	height := emulator.Height()
+	var currentLines []string
+
+	// Extract all current non-empty lines
+	for y := 0; y < height; y++ {
+		line := extractLine(emulator, y)
+		if len(line) > 0 {
+			currentLines = append(currentLines, line)
+		}
+	}
+
+	// Find and save only new lines
+	savedCount := len(*savedLines)
+	for i := savedCount; i < len(currentLines); i++ {
+		if _, err := file.WriteString(currentLines[i] + "\n"); err != nil {
+			return fmt.Errorf("failed to write to session file: %w", err)
+		}
+	}
+
+	// Update saved lines
+	*savedLines = currentLines
+
+	// Flush to disk
+	if err := file.Sync(); err != nil {
+		return fmt.Errorf("failed to sync session file: %w", err)
+	}
+
+	return nil
+}
+
+// trimRight removes trailing whitespace from string
+func trimRight(s string) string {
+	end := len(s)
+	for end > 0 && (s[end-1] == ' ' || s[end-1] == '\t') {
+		end--
+	}
+	return s[:end]
+}
+
+// SetupIOCopy sets up bidirectional I/O copying between the terminal and PTY
+// with state-based saving: saves when user starts typing after command output
+func SetupIOCopy(ptmx *os.File, sessionFile *os.File) error {
+	// Get current terminal size for virtual terminal
+	width, height, err := term.GetSize(int(os.Stdin.Fd()))
+	if err != nil {
+		// Fallback to standard 80x24 if we can't get size
+		width, height = 80, 24
+	}
+
+	// Create virtual terminal emulator
+	emulator := vt.NewEmulator(width, height)
+
+	// Track state and saved lines
+	state := waitingForEnter
+	var savedLines []string
+
+	// Goroutine 1: Read from PTY → write to stdout + feed to emulator
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := ptmx.Read(buf)
+			if n > 0 {
+				os.Stdout.Write(buf[:n])
+				emulator.Write(buf[:n])
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	// Goroutine 2: Read from stdin → detect state transitions + write to PTY
+	go func() {
+		buf := make([]byte, 1024)
+		for {
+			n, err := os.Stdin.Read(buf)
+			if err != nil {
+				return
+			}
+
+			if n > 0 {
+				// Write input to PTY first
+				ptmx.Write(buf[:n])
+
+				// Small delay to let the command line appear in the buffer
+				time.Sleep(10 * time.Millisecond)
+
+				// Detect Enter key or typing during output
+				for i := 0; i < n; i++ {
+					if buf[i] == '\r' || buf[i] == '\n' {
+						// Enter pressed → save command line + transition to waitingForOutput
+						saveErr := saveNewContent(emulator, sessionFile, &savedLines)
+						if saveErr != nil {
+							// Silently handle errors
+						}
+						state = waitingForOutput
+						break
+					} else if state == waitingForOutput {
+						// Any key pressed while waiting for output → save output + transition
+						saveErr := saveNewContent(emulator, sessionFile, &savedLines)
+						if saveErr != nil {
+							// Silently handle errors
+						}
+						state = waitingForEnter
+						break
+					}
+				}
+			}
+		}
+	}()
+
+	return nil
 }
 
 // StartRecording starts a new recording session
