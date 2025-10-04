@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -122,6 +123,7 @@ type captureState int
 const (
 	waitingForEnter  captureState = iota // Waiting for user to press Enter
 	waitingForOutput                     // Waiting for command output to complete
+	paused                               // Paused during fullscreen apps (vim, less, etc)
 )
 
 // extractLine gets a single line from the emulator, trimmed
@@ -181,8 +183,40 @@ func trimRight(s string) string {
 	return s[:end]
 }
 
+// detectAlternateScreen checks if buffer contains alternate screen codes
+// Returns: enterScreen (true if entering vim/less), exitScreen (true if exiting)
+func detectAlternateScreen(buf []byte, n int) (enterScreen bool, exitScreen bool) {
+	// Search for alternate screen sequences anywhere in buffer
+	s := string(buf[:n])
+
+	// Detect enter alternate screen: ESC[?1049h or ESC[?47h
+	if containsSequence(s, "\x1b[?1049h") || containsSequence(s, "\x1b[?47h") ||
+	   containsSequence(s, "\x1b[?1047h") {
+		return true, false
+	}
+
+	// Detect exit alternate screen: ESC[?1049l or ESC[?47l
+	if containsSequence(s, "\x1b[?1049l") || containsSequence(s, "\x1b[?47l") ||
+	   containsSequence(s, "\x1b[?1047l") {
+		return false, true
+	}
+
+	return false, false
+}
+
+// containsSequence checks if string contains the sequence anywhere
+func containsSequence(s, seq string) bool {
+	for i := 0; i <= len(s)-len(seq); i++ {
+		if s[i:i+len(seq)] == seq {
+			return true
+		}
+	}
+	return false
+}
+
 // SetupIOCopy sets up bidirectional I/O copying between the terminal and PTY
 // with state-based saving: saves when user starts typing after command output
+// Automatically pauses recording when fullscreen apps (vim, less) are detected
 func SetupIOCopy(ptmx *os.File, sessionFile *os.File) error {
 	// Get current terminal size for virtual terminal
 	width, height, err := term.GetSize(int(os.Stdin.Fd()))
@@ -194,18 +228,44 @@ func SetupIOCopy(ptmx *os.File, sessionFile *os.File) error {
 	// Create virtual terminal emulator
 	emulator := vt.NewEmulator(width, height)
 
-	// Track state and saved lines
+	// Track state and saved lines (protected by mutex for goroutine safety)
+	var stateMutex sync.Mutex
 	state := waitingForEnter
 	var savedLines []string
 
-	// Goroutine 1: Read from PTY → write to stdout + feed to emulator
+	// Goroutine 1: Read from PTY → write to stdout + detect fullscreen apps
 	go func() {
 		buf := make([]byte, 4096)
 		for {
 			n, err := ptmx.Read(buf)
 			if n > 0 {
+				// Always write to stdout (user sees everything)
 				os.Stdout.Write(buf[:n])
-				emulator.Write(buf[:n])
+
+				// Detect alternate screen buffer transitions
+				enterScreen, exitScreen := detectAlternateScreen(buf, n)
+
+				stateMutex.Lock()
+				if enterScreen {
+					// Entering fullscreen app → pause recording
+					fmt.Fprintf(os.Stderr, "\r\n[tracelyn] Fullscreen app detected - recording paused (nothing will be saved)\r\n")
+					state = paused
+				} else if exitScreen {
+					// Exiting fullscreen app → resume recording
+					fmt.Fprintf(os.Stderr, "\r\n[tracelyn] Recording resumed - fullscreen app session was not recorded\r\n")
+					state = waitingForEnter
+					// Clear emulator to avoid capturing leftover screen data
+					emulator = vt.NewEmulator(width, height)
+					savedLines = []string{}
+				}
+
+				// Only feed to emulator when NOT paused
+				currentState := state
+				stateMutex.Unlock()
+
+				if currentState != paused {
+					emulator.Write(buf[:n])
+				}
 			}
 			if err != nil {
 				return
@@ -226,26 +286,41 @@ func SetupIOCopy(ptmx *os.File, sessionFile *os.File) error {
 				// Write input to PTY first
 				ptmx.Write(buf[:n])
 
+				// Check if paused (in fullscreen app)
+				stateMutex.Lock()
+				currentState := state
+				stateMutex.Unlock()
+
+				if currentState == paused {
+					continue
+				}
+
 				// Small delay to let the command line appear in the buffer
 				time.Sleep(10 * time.Millisecond)
 
 				// Detect Enter key or typing during output
 				for i := 0; i < n; i++ {
 					if buf[i] == '\r' || buf[i] == '\n' {
+						stateMutex.Lock()
 						// Enter pressed → save command line + transition to waitingForOutput
 						saveErr := saveNewContent(emulator, sessionFile, &savedLines)
 						if saveErr != nil {
 							// Silently handle errors
 						}
 						state = waitingForOutput
+						stateMutex.Unlock()
 						break
-					} else if state == waitingForOutput {
-						// Any key pressed while waiting for output → save output + transition
-						saveErr := saveNewContent(emulator, sessionFile, &savedLines)
-						if saveErr != nil {
-							// Silently handle errors
+					} else {
+						stateMutex.Lock()
+						if state == waitingForOutput {
+							// Any key pressed while waiting for output → save output + transition
+							saveErr := saveNewContent(emulator, sessionFile, &savedLines)
+							if saveErr != nil {
+								// Silently handle errors
+							}
+							state = waitingForEnter
 						}
-						state = waitingForEnter
+						stateMutex.Unlock()
 						break
 					}
 				}
@@ -257,9 +332,56 @@ func SetupIOCopy(ptmx *os.File, sessionFile *os.File) error {
 }
 
 // StartRecording starts a new recording session
-// This function will be implemented in later steps
 func StartRecording() error {
-	// TODO: Implement in Step 10
+	// Create session file
+	sessionFile, sessionPath, err := CreateSessionFile()
+	if err != nil {
+		return err
+	}
+	defer sessionFile.Close()
+
+	// Create lock file with current PID
+	pid := os.Getpid()
+	if err := CreateLockFile(pid); err != nil {
+		return err
+	}
+	defer RemoveLockFile()
+
+	// Setup shell command
+	cmd, err := SetupShellCommand()
+	if err != nil {
+		return err
+	}
+
+	// Start PTY
+	ptmx, err := StartPTY(cmd)
+	if err != nil {
+		return err
+	}
+	defer ptmx.Close()
+
+	// Configure terminal
+	oldState, err := ConfigureTerminal(ptmx)
+	if err != nil {
+		return err
+	}
+	defer term.Restore(int(os.Stdin.Fd()), oldState)
+
+	// Handle window resize
+	resizeCh := HandleResize(ptmx)
+	defer signal.Stop(resizeCh)
+
+	// Setup I/O copy with recording
+	if err := SetupIOCopy(ptmx, sessionFile); err != nil {
+		return err
+	}
+
+	// Wait for shell to exit
+	if err := cmd.Wait(); err != nil {
+		// Ignore exit errors (user may exit with Ctrl+D or 'exit')
+	}
+
+	fmt.Printf("\nRecording saved to: %s\n", sessionPath)
 	return nil
 }
 
