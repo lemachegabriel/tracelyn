@@ -142,7 +142,7 @@ func extractLine(emulator *vt.Emulator, y int) string {
 }
 
 // saveNewContent extracts and saves only new lines from the virtual terminal
-// Uses line-by-line tracking to avoid duplicates
+// Uses a hash-based approach to track what has been saved
 func saveNewContent(emulator *vt.Emulator, file *os.File, savedLines *[]string) error {
 	height := emulator.Height()
 	var currentLines []string
@@ -155,16 +155,26 @@ func saveNewContent(emulator *vt.Emulator, file *os.File, savedLines *[]string) 
 		}
 	}
 
-	// Find and save only new lines
-	savedCount := len(*savedLines)
-	for i := savedCount; i < len(currentLines); i++ {
-		if _, err := file.WriteString(currentLines[i] + "\n"); err != nil {
-			return fmt.Errorf("failed to write to session file: %w", err)
+	// Build a set of already saved lines for O(1) lookup
+	savedSet := make(map[string]bool)
+	for _, line := range *savedLines {
+		savedSet[line] = true
+	}
+
+	// Save only lines that haven't been saved yet (preserving order)
+	var newLines []string
+	for _, line := range currentLines {
+		if !savedSet[line] {
+			if _, err := file.WriteString(line + "\n"); err != nil {
+				return fmt.Errorf("failed to write to session file: %w", err)
+			}
+			newLines = append(newLines, line)
+			savedSet[line] = true // Mark as saved
 		}
 	}
 
-	// Update saved lines
-	*savedLines = currentLines
+	// Append new lines to saved lines
+	*savedLines = append(*savedLines, newLines...)
 
 	// Flush to disk
 	if err := file.Sync(); err != nil {
@@ -191,13 +201,13 @@ func detectAlternateScreen(buf []byte, n int) (enterScreen bool, exitScreen bool
 
 	// Detect enter alternate screen: ESC[?1049h or ESC[?47h
 	if containsSequence(s, "\x1b[?1049h") || containsSequence(s, "\x1b[?47h") ||
-	   containsSequence(s, "\x1b[?1047h") {
+		containsSequence(s, "\x1b[?1047h") {
 		return true, false
 	}
 
 	// Detect exit alternate screen: ESC[?1049l or ESC[?47l
 	if containsSequence(s, "\x1b[?1049l") || containsSequence(s, "\x1b[?47l") ||
-	   containsSequence(s, "\x1b[?1047l") {
+		containsSequence(s, "\x1b[?1047l") {
 		return false, true
 	}
 
@@ -215,7 +225,7 @@ func containsSequence(s, seq string) bool {
 }
 
 // SetupIOCopy sets up bidirectional I/O copying between the terminal and PTY
-// with state-based saving: saves when user starts typing after command output
+// with Enter-based saving: only saves content when Enter is pressed
 // Automatically pauses recording when fullscreen apps (vim, less) are detected
 func SetupIOCopy(ptmx *os.File, sessionFile *os.File) error {
 	// Get current terminal size for virtual terminal
@@ -233,7 +243,7 @@ func SetupIOCopy(ptmx *os.File, sessionFile *os.File) error {
 	state := waitingForEnter
 	var savedLines []string
 
-	// Goroutine 1: Read from PTY → write to stdout + detect fullscreen apps
+	// Goroutine 1: Read from PTY → write to stdout + feed emulator + detect fullscreen apps
 	go func() {
 		buf := make([]byte, 4096)
 		for {
@@ -273,7 +283,7 @@ func SetupIOCopy(ptmx *os.File, sessionFile *os.File) error {
 		}
 	}()
 
-	// Goroutine 2: Read from stdin → detect state transitions + write to PTY
+	// Goroutine 2: Read from stdin → detect Enter key + save on Enter only
 	go func() {
 		buf := make([]byte, 1024)
 		for {
@@ -295,31 +305,30 @@ func SetupIOCopy(ptmx *os.File, sessionFile *os.File) error {
 					continue
 				}
 
-				// Small delay to let the command line appear in the buffer
-				time.Sleep(10 * time.Millisecond)
-
-				// Detect Enter key or typing during output
+				// Only save when Enter is pressed
 				for i := 0; i < n; i++ {
 					if buf[i] == '\r' || buf[i] == '\n' {
+						// Wait for shell to process the command and update screen
+						time.Sleep(50 * time.Millisecond)
+
 						stateMutex.Lock()
-						// Enter pressed → save command line + transition to waitingForOutput
-						saveErr := saveNewContent(emulator, sessionFile, &savedLines)
-						if saveErr != nil {
-							// Silently handle errors
-						}
-						state = waitingForOutput
-						stateMutex.Unlock()
-						break
-					} else {
-						stateMutex.Lock()
-						if state == waitingForOutput {
-							// Any key pressed while waiting for output → save output + transition
+
+						if state == waitingForEnter {
+							// Save command line that was just entered
+							saveErr := saveNewContent(emulator, sessionFile, &savedLines)
+							if saveErr != nil {
+								// Silently handle errors
+							}
+							state = waitingForOutput
+						} else if state == waitingForOutput {
+							// Save command output
 							saveErr := saveNewContent(emulator, sessionFile, &savedLines)
 							if saveErr != nil {
 								// Silently handle errors
 							}
 							state = waitingForEnter
 						}
+
 						stateMutex.Unlock()
 						break
 					}
