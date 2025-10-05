@@ -340,6 +340,14 @@ func SetupIOCopy(ptmx *os.File, sessionFile *os.File) error {
 	return nil
 }
 
+// HandleShutdownSignals sets up signal handlers for graceful shutdown
+// Returns a channel that receives SIGTERM and SIGINT signals
+func HandleShutdownSignals() chan os.Signal {
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
+	return sigChan
+}
+
 // StartRecording starts a new recording session
 func StartRecording() error {
 	// Create session file
@@ -380,23 +388,61 @@ func StartRecording() error {
 	resizeCh := HandleResize(ptmx)
 	defer signal.Stop(resizeCh)
 
+	// Handle shutdown signals (SIGTERM, SIGINT)
+	sigChan := HandleShutdownSignals()
+	defer signal.Stop(sigChan)
+
 	// Setup I/O copy with recording
 	if err := SetupIOCopy(ptmx, sessionFile); err != nil {
 		return err
 	}
 
-	// Wait for shell to exit
-	if err := cmd.Wait(); err != nil {
-		// Ignore exit errors (user may exit with Ctrl+D or 'exit')
-	}
+	// Wait for shell to exit or shutdown signal
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+	}()
 
-	fmt.Printf("\nRecording saved to: %s\n", sessionPath)
-	return nil
+	select {
+	case <-sigChan:
+		// Received shutdown signal (SIGTERM or SIGINT)
+		// Terminal will be restored by defer, lock removed, file closed
+		fmt.Printf("\nRecording stopped. Session saved to: %s\n", sessionPath)
+		return nil
+	case err := <-done:
+		// Shell exited normally
+		if err != nil {
+			// Ignore exit errors (user may exit with Ctrl+D or 'exit')
+		}
+		fmt.Printf("\nRecording saved to: %s\n", sessionPath)
+		return nil
+	}
 }
 
-// StopRecording stops the current recording session
-// This function will be implemented in later steps
+// StopRecording stops the current recording session by sending SIGTERM to the recording process
 func StopRecording() error {
-	// TODO: Implement in Step 11
+	// Read the lock file to get the recording process PID
+	pid, err := ReadLockFile()
+	if err != nil {
+		return fmt.Errorf("no active recording session found")
+	}
+
+	// Check if process is actually running
+	if !IsProcessRunning(pid) {
+		// Clean up stale lock file
+		RemoveLockFile()
+		return fmt.Errorf("recording process is not running (stale lock file removed)")
+	}
+
+	// Send SIGTERM signal to gracefully stop the recording
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return fmt.Errorf("failed to find recording process: %w", err)
+	}
+
+	if err := process.Signal(syscall.SIGTERM); err != nil {
+		return fmt.Errorf("failed to stop recording: %w", err)
+	}
+
 	return nil
 }
