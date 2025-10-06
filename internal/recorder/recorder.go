@@ -350,6 +350,15 @@ func HandleShutdownSignals() chan os.Signal {
 
 // StartRecording starts a new recording session
 func StartRecording() error {
+	// Load session registry
+	registry, err := LoadSessions()
+	if err != nil {
+		return err
+	}
+
+	// Cleanup stale sessions
+	registry.CleanupStaleSessions()
+
 	// Create session file
 	sessionFile, sessionPath, err := CreateSessionFile()
 	if err != nil {
@@ -357,12 +366,21 @@ func StartRecording() error {
 	}
 	defer sessionFile.Close()
 
-	// Create lock file with current PID
-	pid := os.Getpid()
-	if err := CreateLockFile(pid); err != nil {
+	// Register session in registry
+	session := registry.CreateSession(
+		filepath.Base(sessionPath),
+		sessionPath,
+		os.Getpid(),
+	)
+	if err := registry.Save(); err != nil {
 		return err
 	}
-	defer RemoveLockFile()
+
+	// Ensure cleanup on exit
+	defer func() {
+		registry.RemoveSession(session.ID)
+		registry.Save()
+	}()
 
 	// Setup shell command
 	cmd, err := SetupShellCommand()
@@ -406,7 +424,7 @@ func StartRecording() error {
 	select {
 	case <-sigChan:
 		// Received shutdown signal (SIGTERM or SIGINT)
-		// Terminal will be restored by defer, lock removed, file closed
+		// Terminal will be restored by defer, session removed, file closed
 		fmt.Printf("\nRecording stopped. Session saved to: %s\n", sessionPath)
 		return nil
 	case err := <-done:
@@ -419,30 +437,47 @@ func StartRecording() error {
 	}
 }
 
-// StopRecording stops the current recording session by sending SIGTERM to the recording process
-func StopRecording() error {
-	// Read the lock file to get the recording process PID
-	pid, err := ReadLockFile()
+// StopSessionByID stops a specific recording session by ID
+func StopSessionByID(sessionID string) error {
+	registry, err := LoadSessions()
 	if err != nil {
-		return fmt.Errorf("no active recording session found")
+		return err
 	}
 
-	// Check if process is actually running
-	if !IsProcessRunning(pid) {
-		// Clean up stale lock file
-		RemoveLockFile()
-		return fmt.Errorf("recording process is not running (stale lock file removed)")
-	}
-
-	// Send SIGTERM signal to gracefully stop the recording
-	process, err := os.FindProcess(pid)
+	session, err := registry.GetSession(sessionID)
 	if err != nil {
-		return fmt.Errorf("failed to find recording process: %w", err)
+		return fmt.Errorf("session not found: %s", sessionID)
 	}
 
-	if err := process.Signal(syscall.SIGTERM); err != nil {
-		return fmt.Errorf("failed to stop recording: %w", err)
+	if !IsProcessRunning(session.PID) {
+		registry.RemoveSession(sessionID)
+		registry.Save()
+		return fmt.Errorf("session process is not running")
 	}
 
-	return nil
+	process, err := os.FindProcess(session.PID)
+	if err != nil {
+		return fmt.Errorf("failed to find session process: %w", err)
+	}
+
+	return process.Signal(syscall.SIGTERM)
+}
+
+// StopCurrentSession stops the recording session in the current terminal
+func StopCurrentSession() error {
+	// Get parent PID (the shell running tracelyn stop)
+	ppid := os.Getppid()
+
+	registry, err := LoadSessions()
+	if err != nil {
+		return err
+	}
+
+	// Find session by PID
+	session, err := registry.GetSessionByPID(ppid)
+	if err != nil {
+		return fmt.Errorf("no active session in current terminal")
+	}
+
+	return StopSessionByID(session.ID)
 }

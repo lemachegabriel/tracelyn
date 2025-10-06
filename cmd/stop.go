@@ -8,12 +8,25 @@ import (
 )
 
 var stopCmd = &cobra.Command{
-	Use:   "stop",
-	Short: "Stop recording terminal session",
-	Long:  `Stops the current recording session and saves the session file.`,
+	Use:   "stop [session-id]",
+	Short: "Stop recording session",
+	Long:  `Stops the recording session in the current terminal, or a specific session by ID.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		fmt.Println("Stopping recording session...")
-		return recorder.StopRecording()
+		if len(args) > 0 {
+			// Stop specific session by ID
+			sessionID := args[0]
+			if err := recorder.StopSessionByID(sessionID); err != nil {
+				return err
+			}
+			fmt.Printf("Stopped recording session: %s\n", sessionID)
+			return nil
+		}
+
+		// Stop session in current terminal
+		if err := recorder.StopCurrentSession(); err != nil {
+			return err
+		}
+		return nil
 	},
 }
 

@@ -12,12 +12,7 @@ var recordCmd = &cobra.Command{
 	Short: "Start recording terminal session",
 	Long:  `Starts recording all terminal commands and outputs to a session file in the sessions/ directory.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		// Check if there's already a recording in progress
-		if err := recorder.CheckExistingRecording(); err != nil {
-			return err
-		}
-
-		fmt.Println("Starting recording session...")
+		fmt.Println("Starting new recording session...")
 		return recorder.StartRecording()
 	},
 }
