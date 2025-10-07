@@ -12,11 +12,13 @@ import (
 
 // Session represents a single recording session
 type Session struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	FilePath  string    `json:"file_path"`
-	PID       int       `json:"pid"`
-	CreatedAt time.Time `json:"created_at"`
+	ID          string     `json:"id"`
+	Name        string     `json:"name"`
+	FilePath    string     `json:"file_path"`
+	PID         int        `json:"pid"`
+	Status      string     `json:"status"` // "active" or "completed"
+	CreatedAt   time.Time  `json:"created_at"`
+	CompletedAt *time.Time `json:"completed_at,omitempty"`
 }
 
 // SessionRegistry manages all active recording sessions
@@ -111,11 +113,29 @@ func (r *SessionRegistry) CreateSession(name, filePath string, pid int) *Session
 		Name:      name,
 		FilePath:  filePath,
 		PID:       pid,
+		Status:    "active",
 		CreatedAt: time.Now(),
 	}
 
 	r.Sessions = append(r.Sessions, *session)
 	return session
+}
+
+// CompleteSession marks a session as completed
+func (r *SessionRegistry) CompleteSession(id string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for i := range r.Sessions {
+		if r.Sessions[i].ID == id {
+			r.Sessions[i].Status = "completed"
+			now := time.Now()
+			r.Sessions[i].CompletedAt = &now
+			return nil
+		}
+	}
+
+	return fmt.Errorf("session not found: %s", id)
 }
 
 // GetSession gets a session by ID
@@ -132,13 +152,24 @@ func (r *SessionRegistry) GetSession(id string) (*Session, error) {
 	return nil, fmt.Errorf("session not found: %s", id)
 }
 
-// RemoveSession removes a session from the registry
+// RemoveSession removes a session from the registry and deletes the session file
 func (r *SessionRegistry) RemoveSession(id string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	for i, session := range r.Sessions {
 		if session.ID == id {
+			// Only allow removing completed sessions
+			if session.Status == "active" {
+				return fmt.Errorf("cannot remove active session: %s (use 'tracelyn stop %s' first)", id, id)
+			}
+
+			// Delete the session file
+			if err := os.Remove(session.FilePath); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("failed to delete session file: %w", err)
+			}
+
+			// Remove from registry
 			r.Sessions = append(r.Sessions[:i], r.Sessions[i+1:]...)
 			return nil
 		}
@@ -160,6 +191,28 @@ func (r *SessionRegistry) ListActiveSessions() []Session {
 	}
 
 	return active
+}
+
+// ListAllSessions returns all sessions with their active status
+func (r *SessionRegistry) ListAllSessions() []Session {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.Sessions
+}
+
+// IsSessionActive checks if a session's process is still running
+func (r *SessionRegistry) IsSessionActive(sessionID string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for _, session := range r.Sessions {
+		if session.ID == sessionID {
+			return IsProcessRunning(session.PID)
+		}
+	}
+
+	return false
 }
 
 // CleanupStaleSessions removes sessions with dead PIDs
@@ -191,3 +244,4 @@ func (r *SessionRegistry) GetSessionByPID(pid int) (*Session, error) {
 
 	return nil, fmt.Errorf("no session found for PID %d", pid)
 }
+

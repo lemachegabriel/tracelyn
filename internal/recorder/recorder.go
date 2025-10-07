@@ -378,8 +378,13 @@ func StartRecording() error {
 
 	// Ensure cleanup on exit
 	defer func() {
-		registry.RemoveSession(session.ID)
-		registry.Save()
+		// Reload registry to get latest state (avoid race condition)
+		currentRegistry, err := LoadSessions()
+		if err != nil {
+			return
+		}
+		currentRegistry.CompleteSession(session.ID)
+		currentRegistry.Save()
 	}()
 
 	// Setup shell command
@@ -450,7 +455,7 @@ func StopSessionByID(sessionID string) error {
 	}
 
 	if !IsProcessRunning(session.PID) {
-		registry.RemoveSession(sessionID)
+		registry.CompleteSession(sessionID)
 		registry.Save()
 		return fmt.Errorf("session process is not running")
 	}

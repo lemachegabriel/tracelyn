@@ -9,24 +9,28 @@ import (
 
 var listCmd = &cobra.Command{
 	Use:   "list",
-	Short: "List all active recording sessions",
-	Long:  `Shows all currently active recording sessions with their IDs and PIDs.`,
+	Short: "List all recording sessions",
+	Long:  `Shows all recording sessions (active and completed) with their IDs and status.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		registry, err := recorder.LoadSessions()
 		if err != nil {
 			return err
 		}
 
-		sessions := registry.ListActiveSessions()
+		sessions := registry.ListAllSessions()
 
 		if len(sessions) == 0 {
-			fmt.Println("No active recording sessions")
+			fmt.Println("No recording sessions found")
 			return nil
 		}
 
-		fmt.Println("Active recording sessions:")
+		fmt.Println("Recording sessions:")
 		for _, s := range sessions {
-			fmt.Printf("  [%s] %s (PID: %d)\n", s.ID, s.Name, s.PID)
+			if s.Status == "active" {
+				fmt.Printf("  [%s] ✓ ACTIVE   %s (PID: %d)\n", s.ID, s.Name, s.PID)
+			} else {
+				fmt.Printf("  [%s] ● COMPLETED %s\n", s.ID, s.Name)
+			}
 		}
 		return nil
 	},
