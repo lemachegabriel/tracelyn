@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"syscall"
@@ -27,12 +28,71 @@ type SessionRegistry struct {
 	mu       sync.Mutex // For concurrent access
 }
 
-const registryFile = ".tracelyn.sessions"
+// getTracelynDir returns the tracelyn directory path (~/.tracelyn)
+func getTracelynDir() (string, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("failed to get user home directory: %w", err)
+	}
+	return filepath.Join(homeDir, ".tracelyn"), nil
+}
+
+// getRegistryFilePath returns the full path to the registry file
+func getRegistryFilePath() (string, error) {
+	dir, err := getTracelynDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "sessions.json"), nil
+}
+
+// getSessionsDir returns the sessions directory path (~/.tracelyn/sessions)
+func getSessionsDir() (string, error) {
+	dir, err := getTracelynDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "sessions"), nil
+}
+
+// ensureTracelynDirs creates the tracelyn directories if they don't exist
+func ensureTracelynDirs() error {
+	dir, err := getTracelynDir()
+	if err != nil {
+		return err
+	}
+
+	// Create ~/.tracelyn directory
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("failed to create tracelyn directory: %w", err)
+	}
+
+	// Create ~/.tracelyn/sessions directory
+	sessionsDir, err := getSessionsDir()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(sessionsDir, 0755); err != nil {
+		return fmt.Errorf("failed to create sessions directory: %w", err)
+	}
+
+	return nil
+}
 
 // LoadSessions loads the session registry from file, creates if not exists
 func LoadSessions() (*SessionRegistry, error) {
+	// Ensure directories exist
+	if err := ensureTracelynDirs(); err != nil {
+		return nil, err
+	}
+
 	registry := &SessionRegistry{
 		Sessions: []Session{},
+	}
+
+	registryFile, err := getRegistryFilePath()
+	if err != nil {
+		return nil, err
 	}
 
 	file, err := os.OpenFile(registryFile, os.O_RDWR|os.O_CREATE, 0644)
@@ -71,6 +131,11 @@ func LoadSessions() (*SessionRegistry, error) {
 func (r *SessionRegistry) Save() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	registryFile, err := getRegistryFilePath()
+	if err != nil {
+		return err
+	}
 
 	file, err := os.OpenFile(registryFile, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {

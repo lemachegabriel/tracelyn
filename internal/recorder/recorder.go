@@ -18,24 +18,29 @@ import (
 // CreateSessionFile creates a new session file with timestamp-based naming
 // Returns the file handle, filename, and any error
 func CreateSessionFile() (*os.File, string, error) {
-	// Ensure sessions directory exists
-	sessionsDir := "sessions"
-	if err := os.MkdirAll(sessionsDir, 0755); err != nil {
-		return nil, "", fmt.Errorf("failed to create sessions directory: %w", err)
+	// Ensure tracelyn directories exist
+	if err := ensureTracelynDirs(); err != nil {
+		return nil, "", err
+	}
+
+	// Get sessions directory path
+	sessionsDir, err := getSessionsDir()
+	if err != nil {
+		return nil, "", err
 	}
 
 	// Generate timestamp-based filename
 	timestamp := time.Now().Format("20060102_150405")
 	filename := fmt.Sprintf("session_%s.txt", timestamp)
-	filepath := filepath.Join(sessionsDir, filename)
+	filePath := filepath.Join(sessionsDir, filename)
 
 	// Create the session file
-	file, err := os.Create(filepath)
+	file, err := os.Create(filePath)
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to create session file: %w", err)
 	}
 
-	return file, filepath, nil
+	return file, filePath, nil
 }
 
 // SetupShellCommand creates a transparent sub-shell command using the user's default shell
