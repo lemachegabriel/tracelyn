@@ -64,7 +64,6 @@ archives:
     files:
       - LICENSE
       - README.md
-      - CLAUDE.md
 
 # Checksum file
 checksum:
