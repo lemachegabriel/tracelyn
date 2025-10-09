@@ -137,7 +137,7 @@ nfpms:
     #   postinstall: "scripts/postinstall.sh"
 
 # Homebrew tap
-homebrew:
+brews:
   - # Repository to push the formula to
     repository:
       owner: lemachegabriel
@@ -150,7 +150,7 @@ homebrew:
       email: bot@goreleaser.com
 
     # Folder inside the repository to put the formula
-    folder: Formula
+    directory: Formula
 
     # App name
     name: tracelyn
