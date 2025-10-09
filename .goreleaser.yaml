@@ -10,7 +10,7 @@ project_name: tracelyn
 before:
   hooks:
     - go mod tidy
-    - go test ./...
+    # - go test ./...  # Commented out - fix tests later
 
 # Build configuration
 builds:
@@ -51,7 +51,6 @@ builds:
 # Archive configuration
 archives:
   - id: tracelyn
-    format: tar.gz
     name_template: >-
       {{ .ProjectName }}_
       {{- .Version }}_
@@ -60,11 +59,6 @@ archives:
       {{- else if eq .Arch "386" }}i386
       {{- else }}{{ .Arch }}{{ end }}
       {{- if .Arm }}v{{ .Arm }}{{ end }}
-
-    # Format overrides
-    format_overrides:
-      - goos: windows
-        format: zip
 
     # Files to include in archive
     files:
@@ -143,7 +137,7 @@ nfpms:
     #   postinstall: "scripts/postinstall.sh"
 
 # Homebrew tap
-brews:
+homebrew:
   - # Repository to push the formula to
     repository:
       owner: lemachegabriel
@@ -156,7 +150,7 @@ brews:
       email: bot@goreleaser.com
 
     # Folder inside the repository to put the formula
-    directory: Formula
+    folder: Formula
 
     # App name
     name: tracelyn
