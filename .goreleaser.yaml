@@ -123,10 +123,6 @@ nfpms:
       - deb
       - rpm
 
-    # Binaries
-    binaries:
-      - tracelyn
-
     # Files to include
     contents:
       - src: LICENSE
