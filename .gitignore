@@ -1,3 +1,14 @@
 /cmd/test.go
 /sessions
 /docs
+
+# GoReleaser
+dist/
+*.tar.gz
+*.zip
+*.deb
+*.rpm
+
+# Build artifacts
+tracelyn
+/bin/

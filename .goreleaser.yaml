@@ -1,0 +1,238 @@
+# GoReleaser configuration for Tracelyn
+# Documentation: https://goreleaser.com
+
+version: 2
+
+# Project information
+project_name: tracelyn
+
+# Before hook - run tests before building
+before:
+  hooks:
+    - go mod tidy
+    - go test ./...
+
+# Build configuration
+builds:
+  - id: tracelyn
+    binary: tracelyn
+    main: ./main.go
+
+    # Environment variables
+    env:
+      - CGO_ENABLED=0
+
+    # Build for multiple platforms
+    goos:
+      - linux
+      - darwin
+      # - windows  # Uncomment if you want Windows support
+
+    goarch:
+      - amd64
+      - arm64
+
+    # Ignore combinations
+    ignore:
+      # - goos: windows
+      #   goarch: arm64
+
+    # ldflags for version information
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
+
+    # Flags
+    flags:
+      - -trimpath
+
+# Archive configuration
+archives:
+  - id: tracelyn
+    format: tar.gz
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "386" }}i386
+      {{- else }}{{ .Arch }}{{ end }}
+      {{- if .Arm }}v{{ .Arm }}{{ end }}
+
+    # Format overrides
+    format_overrides:
+      - goos: windows
+        format: zip
+
+    # Files to include in archive
+    files:
+      - LICENSE
+      - README.md
+      - CLAUDE.md
+
+# Checksum file
+checksum:
+  name_template: 'checksums.txt'
+
+# Snapshot configuration (for dev builds)
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+# Changelog configuration
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^ci:'
+      - '^chore:'
+      - '^typo:'
+  groups:
+    - title: Features
+      regexp: '^.*?feat(\([[:word:]]+\))??!?:.+$'
+      order: 0
+    - title: 'Bug Fixes'
+      regexp: '^.*?fix(\([[:word:]]+\))??!?:.+$'
+      order: 1
+    - title: 'Improvements'
+      regexp: '^.*?(perf|refactor)(\([[:word:]]+\))??!?:.+$'
+      order: 2
+    - title: Others
+      order: 999
+
+# APT/DEB packages for Debian/Ubuntu
+nfpms:
+  - id: tracelyn
+    package_name: tracelyn
+
+    # Vendor and maintainer info
+    vendor: Tracelyn
+    homepage: https://github.com/lemachegabriel/tracelyn
+    maintainer: Gabriel Lemache <your-email@example.com>
+    description: |
+      CLI tool for recording terminal sessions to clean plain text files.
+      Tracelyn creates a transparent sub-shell that captures all commands
+      and outputs without interfering with your workflow.
+    license: MIT
+
+    # Formats
+    formats:
+      - deb
+      - rpm
+
+    # Binaries
+    binaries:
+      - tracelyn
+
+    # Files to include
+    contents:
+      - src: LICENSE
+        dst: /usr/share/doc/tracelyn/LICENSE
+      - src: README.md
+        dst: /usr/share/doc/tracelyn/README.md
+
+    # Dependencies (if any)
+    # dependencies:
+    #   - git
+
+    # Recommends
+    # recommends:
+    #   - bash
+
+    # Scripts (post-install, pre-remove, etc)
+    # scripts:
+    #   postinstall: "scripts/postinstall.sh"
+
+# Homebrew tap
+brews:
+  - # Repository to push the formula to
+    repository:
+      owner: lemachegabriel
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+
+    # Git author used to commit to the repository
+    commit_author:
+      name: goreleaserbot
+      email: bot@goreleaser.com
+
+    # Folder inside the repository to put the formula
+    directory: Formula
+
+    # App name
+    name: tracelyn
+
+    # Homepage
+    homepage: https://github.com/lemachegabriel/tracelyn
+
+    # Description
+    description: |
+      CLI tool for recording terminal sessions to clean plain text files.
+      Creates a transparent sub-shell that captures all commands and outputs.
+
+    # License
+    license: MIT
+
+    # Dependencies
+    # dependencies:
+    #   - name: git
+
+    # Install configuration
+    install: |
+      bin.install "tracelyn"
+
+    # Test configuration
+    test: |
+      system "#{bin}/tracelyn", "--version"
+
+# GitHub Release
+release:
+  # Repo to release to
+  github:
+    owner: lemachegabriel
+    name: tracelyn
+
+  # Release name template
+  name_template: "v{{.Version}}"
+
+  # Draft release
+  draft: false
+
+  # Prerelease
+  prerelease: auto
+
+  # Release discussion
+  # discussion_category_name: Releases
+
+  # Header and footer
+  header: |
+    ## Installation
+
+    ### Homebrew (macOS/Linux)
+    ```bash
+    brew tap lemachegabriel/tap
+    brew install tracelyn
+    ```
+
+    ### APT (Debian/Ubuntu)
+    ```bash
+    # Add repository (first time only)
+    echo "deb [trusted=yes] https://apt.fury.io/lemachegabriel/ /" | sudo tee /etc/apt/sources.list.d/tracelyn.list
+    sudo apt update
+    sudo apt install tracelyn
+    ```
+
+    ### Manual Installation
+    Download the appropriate archive for your platform below.
+
+  footer: |
+    ## Changelog
+
+    For a full list of changes, see above.
+
+    ---
+
+    **Full Changelog**: https://github.com/lemachegabriel/tracelyn/compare/{{ .PreviousTag }}...{{ .Tag }}
