@@ -32,3 +32,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+      - name: Upload to Gemfury
+        if: success()
+        run: |
+          for file in dist/*.deb; do
+            curl -F package=@$file https://${{ secrets.FURY_TOKEN }}@push.fury.io/lemachegabriel/
+          done
+        env:
+          FURY_TOKEN: ${{ secrets.FURY_TOKEN }}  
