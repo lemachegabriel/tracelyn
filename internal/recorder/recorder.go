@@ -45,7 +45,8 @@ func CreateSessionFile() (*os.File, string, error) {
 
 // SetupShellCommand creates a transparent sub-shell command using the user's default shell
 // that inherits the current environment and working directory
-func SetupShellCommand() (*exec.Cmd, error) {
+// Sets TRACELYN_SESSION_ID environment variable to identify the recording session
+func SetupShellCommand(sessionID string) (*exec.Cmd, error) {
 	// Get current working directory
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -63,6 +64,9 @@ func SetupShellCommand() (*exec.Cmd, error) {
 
 	// Copy all environment variables to make sub-shell transparent
 	cmd.Env = os.Environ()
+
+	// Add TRACELYN_SESSION_ID to identify this recording session
+	cmd.Env = append(cmd.Env, fmt.Sprintf("TRACELYN_SESSION_ID=%s", sessionID))
 
 	// Set working directory to preserve user's location
 	cmd.Dir = cwd
@@ -371,11 +375,11 @@ func StartRecording() error {
 	}
 	defer sessionFile.Close()
 
-	// Register session in registry
+	// Register session in registry with current process PID (the tracelyn record process)
 	session := registry.CreateSession(
 		filepath.Base(sessionPath),
 		sessionPath,
-		os.Getpid(),
+		os.Getpid(), // PID of the tracelyn record process
 	)
 	if err := registry.Save(); err != nil {
 		return err
@@ -392,8 +396,8 @@ func StartRecording() error {
 		currentRegistry.Save()
 	}()
 
-	// Setup shell command
-	cmd, err := SetupShellCommand()
+	// Setup shell command with session ID in environment
+	cmd, err := SetupShellCommand(session.ID)
 	if err != nil {
 		return err
 	}
@@ -474,20 +478,18 @@ func StopSessionByID(sessionID string) error {
 }
 
 // StopCurrentSession stops the recording session in the current terminal
-func StopCurrentSession() error {
-	// Get parent PID (the shell running tracelyn stop)
-	ppid := os.Getppid()
-
-	registry, err := LoadSessions()
-	if err != nil {
-		return err
+// Returns the session ID that was stopped
+func StopCurrentSession() (string, error) {
+	// Check if TRACELYN_SESSION_ID environment variable is set
+	sessionID := os.Getenv("TRACELYN_SESSION_ID")
+	if sessionID == "" {
+		return "", fmt.Errorf("no active session in current terminal")
 	}
 
-	// Find session by PID
-	session, err := registry.GetSessionByPID(ppid)
-	if err != nil {
-		return fmt.Errorf("no active session in current terminal")
+	// Stop the session by ID
+	if err := StopSessionByID(sessionID); err != nil {
+		return "", err
 	}
 
-	return StopSessionByID(session.ID)
+	return sessionID, nil
 }

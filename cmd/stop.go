@@ -23,9 +23,11 @@ var stopCmd = &cobra.Command{
 		}
 
 		// Stop session in current terminal
-		if err := recorder.StopCurrentSession(); err != nil {
+		sessionID, err := recorder.StopCurrentSession()
+		if err != nil {
 			return err
 		}
+		fmt.Printf("Stopped recording session: %s\n", sessionID)
 		return nil
 	},
 }
