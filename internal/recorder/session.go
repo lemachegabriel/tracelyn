@@ -29,7 +29,18 @@ type SessionRegistry struct {
 }
 
 // getTracelynDir returns the tracelyn directory path (~/.tracelyn)
+// If TRACELYN_LOCAL=1 is set, uses ./.tracelyn in the current directory instead
 func getTracelynDir() (string, error) {
+	// Check if we're in local development mode
+	if os.Getenv("TRACELYN_LOCAL") == "1" {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return "", fmt.Errorf("failed to get current directory: %w", err)
+		}
+		return filepath.Join(cwd, ".tracelyn"), nil
+	}
+
+	// Default behavior: use home directory
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("failed to get user home directory: %w", err)
@@ -280,19 +291,21 @@ func (r *SessionRegistry) IsSessionActive(sessionID string) bool {
 	return false
 }
 
-// CleanupStaleSessions removes sessions with dead PIDs
+// CleanupStaleSessions marks sessions with dead PIDs as completed
+// Sessions are kept in registry until explicitly removed by user
 func (r *SessionRegistry) CleanupStaleSessions() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	var activeSessions []Session
-	for _, session := range r.Sessions {
-		if IsProcessRunning(session.PID) {
-			activeSessions = append(activeSessions, session)
+	for i := range r.Sessions {
+		// If session is marked as active but process is not running, mark as completed
+		if r.Sessions[i].Status == "active" && !IsProcessRunning(r.Sessions[i].PID) {
+			r.Sessions[i].Status = "completed"
+			now := time.Now()
+			r.Sessions[i].CompletedAt = &now
 		}
 	}
 
-	r.Sessions = activeSessions
 	return nil
 }
 

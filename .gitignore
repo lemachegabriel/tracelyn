@@ -1,6 +1,7 @@
 /cmd/test.go
 /sessions
 /docs
+/.tracelyn
 
 # GoReleaser
 dist/
