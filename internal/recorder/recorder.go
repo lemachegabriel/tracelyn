@@ -151,7 +151,7 @@ func extractLine(emulator *vt.Emulator, y int) string {
 }
 
 // saveNewContent extracts and saves only new lines from the virtual terminal
-// Uses a hash-based approach to track what has been saved
+// Compares line-by-line with previous screen state (allows repeated outputs)
 func saveNewContent(emulator *vt.Emulator, file *os.File, savedLines *[]string) error {
 	height := emulator.Height()
 	var currentLines []string
@@ -164,26 +164,32 @@ func saveNewContent(emulator *vt.Emulator, file *os.File, savedLines *[]string) 
 		}
 	}
 
-	// Build a set of already saved lines for O(1) lookup
-	savedSet := make(map[string]bool)
-	for _, line := range *savedLines {
-		savedSet[line] = true
+	// Find the minimum common prefix between current and saved lines
+	// This handles terminal scrolling and new content appearing
+	minLen := len(*savedLines)
+	if len(currentLines) < minLen {
+		minLen = len(currentLines)
 	}
 
-	// Save only lines that haven't been saved yet (preserving order)
-	var newLines []string
-	for _, line := range currentLines {
-		if !savedSet[line] {
-			if _, err := file.WriteString(line + "\n"); err != nil {
-				return fmt.Errorf("failed to write to session file: %w", err)
-			}
-			newLines = append(newLines, line)
-			savedSet[line] = true // Mark as saved
+	// Find where the content diverges
+	divergeIdx := 0
+	for i := 0; i < minLen; i++ {
+		if (*savedLines)[i] == currentLines[i] {
+			divergeIdx = i + 1
+		} else {
+			break
 		}
 	}
 
-	// Append new lines to saved lines
-	*savedLines = append(*savedLines, newLines...)
+	// Save all new lines after the divergence point
+	for i := divergeIdx; i < len(currentLines); i++ {
+		if _, err := file.WriteString(currentLines[i] + "\n"); err != nil {
+			return fmt.Errorf("failed to write to session file: %w", err)
+		}
+	}
+
+	// Update saved lines to current screen state
+	*savedLines = currentLines
 
 	// Flush to disk
 	if err := file.Sync(); err != nil {
