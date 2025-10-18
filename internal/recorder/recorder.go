@@ -106,7 +106,8 @@ func ConfigureTerminal(ptmx *os.File) (*term.State, error) {
 
 // HandleResize listens for SIGWINCH (window resize) signals and updates the PTY size accordingly
 // Returns the signal channel for cleanup
-func HandleResize(ptmx *os.File) chan os.Signal {
+// Also accepts a callback to recreate the emulator with the new size
+func HandleResize(ptmx *os.File, onResize func(width, height int)) chan os.Signal {
 	// Create channel to receive window resize signals
 	resizeCh := make(chan os.Signal, 1)
 	signal.Notify(resizeCh, syscall.SIGWINCH)
@@ -119,6 +120,17 @@ func HandleResize(ptmx *os.File) chan os.Signal {
 				// Silently ignore resize errors to avoid disrupting the session
 				// The terminal will continue working, just with the old size
 				continue
+			}
+
+			// Get new terminal size
+			width, height, err := term.GetSize(int(os.Stdin.Fd()))
+			if err != nil {
+				continue // Keep old size if we can't read new one
+			}
+
+			// Call callback to recreate emulator with new size
+			if onResize != nil {
+				onResize(width, height)
 			}
 		}
 	}()
@@ -442,7 +454,8 @@ func containsSequence(s, seq string) bool {
 // SetupIOCopy sets up bidirectional I/O copying between the terminal and PTY
 // with Enter-based saving: only saves content when Enter is pressed
 // Automatically pauses recording when fullscreen apps (vim, less) are detected
-func SetupIOCopy(ptmx *os.File, sessionFile *os.File) error {
+// Returns a function that should be called when terminal is resized
+func SetupIOCopy(ptmx *os.File, sessionFile *os.File) (onResize func(int, int), err error) {
 	// Get current terminal size for virtual terminal
 	width, height, err := term.GetSize(int(os.Stdin.Fd()))
 	if err != nil {
@@ -450,13 +463,36 @@ func SetupIOCopy(ptmx *os.File, sessionFile *os.File) error {
 		width, height = 80, 24
 	}
 
-	// Create virtual terminal emulator
-	emulator := vt.NewEmulator(width, height)
+	// Create virtual terminal emulator with MUCH larger buffer to capture all output
+	// Even if output is longer than terminal height, we keep it in the buffer
+	var emulator *vt.Emulator
+	bufferHeight := height * 100  // 100x terminal height (e.g., 60 lines × 100 = 6000 lines buffer)
+	emulator = vt.NewEmulator(width, bufferHeight)
+
+	logDebug("Created emulator with size %dx%d (terminal is %dx%d)", width, bufferHeight, width, height)
 
 	// Track saved lines (protected by mutex for goroutine safety)
 	var stateMutex sync.Mutex
 	var savedLines []string
 	var paused bool
+
+	// Create resize callback that recreates emulator with new size
+	onResize = func(newWidth, newHeight int) {
+		stateMutex.Lock()
+		defer stateMutex.Unlock()
+
+		logDebug("Terminal resized from %dx%d to %dx%d, recreating emulator", width, height, newWidth, newHeight)
+
+		// Recreate emulator with new size (100x buffer height)
+		newBufferHeight := newHeight * 100
+		emulator = vt.NewEmulator(newWidth, newBufferHeight)
+		width, height = newWidth, newHeight
+
+		// Clear saved lines to avoid mismatches with new screen size
+		savedLines = []string{}
+
+		logDebug("Emulator recreated with size %dx%d (terminal is %dx%d), savedLines cleared", newWidth, newBufferHeight, newWidth, newHeight)
+	}
 
 	// Goroutine 1: Read from PTY → write to stdout + feed emulator + detect fullscreen apps
 	go func() {
@@ -558,7 +594,7 @@ func SetupIOCopy(ptmx *os.File, sessionFile *os.File) error {
 		}
 	}()
 
-	return nil
+	return onResize, nil
 }
 
 // HandleShutdownSignals sets up signal handlers for graceful shutdown
@@ -638,18 +674,19 @@ func StartRecording() error {
 	}
 	defer term.Restore(int(os.Stdin.Fd()), oldState)
 
-	// Handle window resize
-	resizeCh := HandleResize(ptmx)
+	// Setup I/O copy with recording (returns resize callback)
+	onResize, err := SetupIOCopy(ptmx, sessionFile)
+	if err != nil {
+		return err
+	}
+
+	// Handle window resize (pass resize callback from SetupIOCopy)
+	resizeCh := HandleResize(ptmx, onResize)
 	defer signal.Stop(resizeCh)
 
 	// Handle shutdown signals (SIGTERM, SIGINT)
 	sigChan := HandleShutdownSignals()
 	defer signal.Stop(sigChan)
-
-	// Setup I/O copy with recording
-	if err := SetupIOCopy(ptmx, sessionFile); err != nil {
-		return err
-	}
 
 	// Wait for shell to exit or shutdown signal
 	done := make(chan error, 1)
