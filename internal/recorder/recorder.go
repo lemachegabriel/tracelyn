@@ -126,15 +126,6 @@ func HandleResize(ptmx *os.File) chan os.Signal {
 	return resizeCh
 }
 
-// captureState represents the current state of the recording session
-type captureState int
-
-const (
-	waitingForEnter  captureState = iota // Waiting for user to press Enter
-	waitingForOutput                     // Waiting for command output to complete
-	paused                               // Paused during fullscreen apps (vim, less, etc)
-)
-
 // extractLine gets a single line from the emulator, trimmed
 func extractLine(emulator *vt.Emulator, y int) string {
 	var line string
@@ -150,9 +141,39 @@ func extractLine(emulator *vt.Emulator, y int) string {
 	return trimRight(line)
 }
 
+// Debug log file (package-level variable)
+var debugLogFile *os.File
+
+// initDebugLog initializes the debug log file
+func initDebugLog() error {
+	dir, err := getTracelynDir()
+	if err != nil {
+		return err
+	}
+
+	logPath := filepath.Join(dir, "debug.log")
+	debugLogFile, err = os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to create debug log: %w", err)
+	}
+
+	// Write timestamp header
+	fmt.Fprintf(debugLogFile, "\n\n=== Recording session started at %s ===\n", time.Now().Format("2006-01-02 15:04:05"))
+	return nil
+}
+
+// logDebug writes to debug log file
+func logDebug(format string, args ...interface{}) {
+	if debugLogFile != nil {
+		fmt.Fprintf(debugLogFile, format+"\n", args...)
+		debugLogFile.Sync()
+	}
+}
+
 // saveNewContent extracts and saves only new lines from the virtual terminal
 // Compares line-by-line with previous screen state (allows repeated outputs)
-func saveNewContent(emulator *vt.Emulator, file *os.File, savedLines *[]string) error {
+// addSeparator adds a "|" separator after the last line when true
+func saveNewContent(emulator *vt.Emulator, file *os.File, savedLines *[]string, addSeparator bool) error {
 	height := emulator.Height()
 	var currentLines []string
 
@@ -181,11 +202,27 @@ func saveNewContent(emulator *vt.Emulator, file *os.File, savedLines *[]string) 
 		}
 	}
 
+	// Debug logging
+	newLinesCount := len(currentLines) - divergeIdx
+	logDebug("saveNewContent called: addSeparator=%v, divergeIdx=%d, newLines=%d, totalLines=%d",
+		addSeparator, divergeIdx, newLinesCount, len(currentLines))
+
 	// Save all new lines after the divergence point
 	for i := divergeIdx; i < len(currentLines); i++ {
-		if _, err := file.WriteString(currentLines[i] + "\n"); err != nil {
+		lineToWrite := currentLines[i]
+
+		// Add separator to the FIRST new line if requested (command line only)
+		// This is the line that contains the command the user just typed
+		if addSeparator && i == divergeIdx {
+			lineToWrite += " ||||"
+			logDebug("  -> Adding separator to line %d: %q", i, lineToWrite)
+		}
+
+		if _, err := file.WriteString(lineToWrite + "\n"); err != nil {
 			return fmt.Errorf("failed to write to session file: %w", err)
 		}
+
+		logDebug("  -> Saved line %d: %q", i, lineToWrite)
 	}
 
 	// Update saved lines to current screen state
@@ -253,10 +290,10 @@ func SetupIOCopy(ptmx *os.File, sessionFile *os.File) error {
 	// Create virtual terminal emulator
 	emulator := vt.NewEmulator(width, height)
 
-	// Track state and saved lines (protected by mutex for goroutine safety)
+	// Track saved lines (protected by mutex for goroutine safety)
 	var stateMutex sync.Mutex
-	state := waitingForEnter
 	var savedLines []string
+	var paused bool
 
 	// Goroutine 1: Read from PTY → write to stdout + feed emulator + detect fullscreen apps
 	go func() {
@@ -274,21 +311,21 @@ func SetupIOCopy(ptmx *os.File, sessionFile *os.File) error {
 				if enterScreen {
 					// Entering fullscreen app → pause recording
 					fmt.Fprintf(os.Stderr, "\r\n[tracelyn] Fullscreen app detected - recording paused (nothing will be saved)\r\n")
-					state = paused
+					paused = true
 				} else if exitScreen {
 					// Exiting fullscreen app → resume recording
 					fmt.Fprintf(os.Stderr, "\r\n[tracelyn] Recording resumed - fullscreen app session was not recorded\r\n")
-					state = waitingForEnter
+					paused = false
 					// Clear emulator to avoid capturing leftover screen data
 					emulator = vt.NewEmulator(width, height)
 					savedLines = []string{}
 				}
 
 				// Only feed to emulator when NOT paused
-				currentState := state
+				isPaused := paused
 				stateMutex.Unlock()
 
-				if currentState != paused {
+				if !isPaused {
 					emulator.Write(buf[:n])
 				}
 			}
@@ -313,10 +350,10 @@ func SetupIOCopy(ptmx *os.File, sessionFile *os.File) error {
 
 				// Check if paused (in fullscreen app)
 				stateMutex.Lock()
-				currentState := state
+				isPaused := paused
 				stateMutex.Unlock()
 
-				if currentState == paused {
+				if isPaused {
 					continue
 				}
 
@@ -328,20 +365,11 @@ func SetupIOCopy(ptmx *os.File, sessionFile *os.File) error {
 
 						stateMutex.Lock()
 
-						if state == waitingForEnter {
-							// Save command line that was just entered
-							saveErr := saveNewContent(emulator, sessionFile, &savedLines)
-							if saveErr != nil {
-								// Silently handle errors
-							}
-							state = waitingForOutput
-						} else if state == waitingForOutput {
-							// Save command output
-							saveErr := saveNewContent(emulator, sessionFile, &savedLines)
-							if saveErr != nil {
-								// Silently handle errors
-							}
-							state = waitingForEnter
+						// Always save with separator (command lines get it, output doesn't matter)
+						logDebug("Enter detected - saving content with separator")
+						saveErr := saveNewContent(emulator, sessionFile, &savedLines, true)
+						if saveErr != nil {
+							logDebug("Error saving: %v", saveErr)
 						}
 
 						stateMutex.Unlock()
@@ -365,6 +393,16 @@ func HandleShutdownSignals() chan os.Signal {
 
 // StartRecording starts a new recording session
 func StartRecording() error {
+	// Initialize debug logging
+	if err := initDebugLog(); err != nil {
+		return err
+	}
+	defer func() {
+		if debugLogFile != nil {
+			debugLogFile.Close()
+		}
+	}()
+
 	// Load session registry
 	registry, err := LoadSessions()
 	if err != nil {
