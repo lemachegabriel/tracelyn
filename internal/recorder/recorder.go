@@ -207,18 +207,6 @@ func saveNewContent(emulator *vt.Emulator, file *os.File, savedLines *[]string, 
 	logDebug("saveNewContent called: commandLine=%q, divergeIdx=%d, newLines=%d, totalLines=%d",
 		commandLine, divergeIdx, newLinesCount, len(currentLines))
 
-	// Handle scroll: when divergeIdx=0 AND we have saved lines AND screen is almost full
-	// This means screen scrolled and we lost context - only save recent lines to avoid re-saving old content
-	if divergeIdx == 0 && len(*savedLines) > 0 && newLinesCount > 40 {
-		logDebug("  -> Scroll detected (divergeIdx=0, %d saved, %d new lines) - only saving last 10 lines", len(*savedLines), newLinesCount)
-		// Only save the last 10 lines (includes new command + recent context)
-		divergeIdx = len(currentLines) - 10
-		if divergeIdx < 0 {
-			divergeIdx = 0
-		}
-		newLinesCount = len(currentLines) - divergeIdx
-	}
-
 	// Save all new lines after the divergence point
 	for i := divergeIdx; i < len(currentLines); i++ {
 		lineToWrite := currentLines[i]
@@ -377,6 +365,15 @@ func SetupIOCopy(ptmx *os.File, sessionFile *os.File) error {
 						cursorPos := emulator.CursorPosition()
 						commandLine := extractLine(emulator, cursorPos.Y)
 						logDebug("Enter detected at cursor Y=%d, captured command line: %q", cursorPos.Y, commandLine)
+
+						// Check if this is the same as the last saved line (empty Enter on prompt)
+						// If so, skip saving to avoid duplicates
+						isEmptyEnter := len(savedLines) > 0 && commandLine == savedLines[len(savedLines)-1]
+						if isEmptyEnter {
+							logDebug("  -> Skipping save: empty Enter (commandLine matches last saved line)")
+							stateMutex.Unlock()
+							break
+						}
 						stateMutex.Unlock()
 
 						// Wait for shell to process the command and update screen
