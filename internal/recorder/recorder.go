@@ -172,8 +172,8 @@ func logDebug(format string, args ...interface{}) {
 
 // saveNewContent extracts and saves only new lines from the virtual terminal
 // Compares line-by-line with previous screen state (allows repeated outputs)
-// addSeparator adds a "|" separator after the last line when true
-func saveNewContent(emulator *vt.Emulator, file *os.File, savedLines *[]string, addSeparator bool) error {
+// commandLine is the line content that should receive the separator (captured when Enter was pressed)
+func saveNewContent(emulator *vt.Emulator, file *os.File, savedLines *[]string, commandLine string) error {
 	height := emulator.Height()
 	var currentLines []string
 
@@ -204,18 +204,29 @@ func saveNewContent(emulator *vt.Emulator, file *os.File, savedLines *[]string, 
 
 	// Debug logging
 	newLinesCount := len(currentLines) - divergeIdx
-	logDebug("saveNewContent called: addSeparator=%v, divergeIdx=%d, newLines=%d, totalLines=%d",
-		addSeparator, divergeIdx, newLinesCount, len(currentLines))
+	logDebug("saveNewContent called: commandLine=%q, divergeIdx=%d, newLines=%d, totalLines=%d",
+		commandLine, divergeIdx, newLinesCount, len(currentLines))
+
+	// Handle scroll: when divergeIdx=0 AND we have saved lines AND screen is almost full
+	// This means screen scrolled and we lost context - only save recent lines to avoid re-saving old content
+	if divergeIdx == 0 && len(*savedLines) > 0 && newLinesCount > 40 {
+		logDebug("  -> Scroll detected (divergeIdx=0, %d saved, %d new lines) - only saving last 10 lines", len(*savedLines), newLinesCount)
+		// Only save the last 10 lines (includes new command + recent context)
+		divergeIdx = len(currentLines) - 10
+		if divergeIdx < 0 {
+			divergeIdx = 0
+		}
+		newLinesCount = len(currentLines) - divergeIdx
+	}
 
 	// Save all new lines after the divergence point
 	for i := divergeIdx; i < len(currentLines); i++ {
 		lineToWrite := currentLines[i]
 
-		// Add separator to the FIRST new line if requested (command line only)
-		// This is the line that contains the command the user just typed
-		if addSeparator && i == divergeIdx {
+		// Add separator if this line matches the command line (the line where Enter was pressed)
+		if commandLine != "" && lineToWrite == commandLine {
 			lineToWrite += " ||||"
-			logDebug("  -> Adding separator to line %d: %q", i, lineToWrite)
+			logDebug("  -> Adding separator to line %d (matched command line): %q", i, lineToWrite)
 		}
 
 		if _, err := file.WriteString(lineToWrite + "\n"); err != nil {
@@ -360,14 +371,20 @@ func SetupIOCopy(ptmx *os.File, sessionFile *os.File) error {
 				// Only save when Enter is pressed
 				for i := 0; i < n; i++ {
 					if buf[i] == '\r' || buf[i] == '\n' {
+						// Capture the command line BEFORE any output appears
+						// Get cursor position to know which line contains the command
+						stateMutex.Lock()
+						cursorPos := emulator.CursorPosition()
+						commandLine := extractLine(emulator, cursorPos.Y)
+						logDebug("Enter detected at cursor Y=%d, captured command line: %q", cursorPos.Y, commandLine)
+						stateMutex.Unlock()
+
 						// Wait for shell to process the command and update screen
 						time.Sleep(50 * time.Millisecond)
 
 						stateMutex.Lock()
-
-						// Always save with separator (command lines get it, output doesn't matter)
-						logDebug("Enter detected - saving content with separator")
-						saveErr := saveNewContent(emulator, sessionFile, &savedLines, true)
+						logDebug("Saving content after 50ms delay")
+						saveErr := saveNewContent(emulator, sessionFile, &savedLines, commandLine)
 						if saveErr != nil {
 							logDebug("Error saving: %v", saveErr)
 						}
