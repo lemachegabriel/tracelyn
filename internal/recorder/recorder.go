@@ -126,6 +126,14 @@ func HandleResize(ptmx *os.File) chan os.Signal {
 	return resizeCh
 }
 
+// maxInt returns the maximum of two integers
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 // extractLine gets a single line from the emulator, trimmed
 func extractLine(emulator *vt.Emulator, y int) string {
 	var line string
@@ -185,20 +193,88 @@ func saveNewContent(emulator *vt.Emulator, file *os.File, savedLines *[]string, 
 		}
 	}
 
-	// Find the minimum common prefix between current and saved lines
-	// This handles terminal scrolling and new content appearing
-	minLen := len(*savedLines)
-	if len(currentLines) < minLen {
-		minLen = len(currentLines)
-	}
-
-	// Find where the content diverges
+	// Find where to start saving from currentLines
 	divergeIdx := 0
-	for i := 0; i < minLen; i++ {
-		if (*savedLines)[i] == currentLines[i] {
-			divergeIdx = i + 1
+
+	// Strategy: Find any sequence from savedLines that appears in currentLines
+	// Search from end of savedLines backwards (more recent = more likely to be visible)
+	// This handles terminal scrolling where old content scrolls out of view
+	if len(*savedLines) > 0 && len(currentLines) > 0 {
+		// Try to find overlap by searching for sequences of lines
+		// Start with longer sequences (more reliable) and work down to 3 lines minimum
+		maxSequenceLen := 10
+		minSequenceLen := 3
+		if len(*savedLines) < maxSequenceLen {
+			maxSequenceLen = len(*savedLines)
+		}
+
+		found := false
+		bestMatch := 0
+		bestMatchPos := 0
+
+		// Try progressively smaller sequence lengths
+		for seqLen := maxSequenceLen; seqLen >= minSequenceLen && !found; seqLen-- {
+			// Search for sequences from savedLines (start from end, go backwards)
+			for savedIdx := len(*savedLines) - seqLen; savedIdx >= 0 && !found; savedIdx-- {
+				savedSequence := (*savedLines)[savedIdx : savedIdx+seqLen]
+
+				// Search for this sequence anywhere in currentLines
+				for currIdx := 0; currIdx <= len(currentLines)-seqLen; currIdx++ {
+					// Check if sequence matches at position currIdx
+					matches := true
+					for j := 0; j < seqLen; j++ {
+						if currentLines[currIdx+j] != savedSequence[j] {
+							matches = false
+							break
+						}
+					}
+
+					if matches {
+						// Found a sequence match!
+						// Position after this sequence in currentLines
+						matchEnd := currIdx + seqLen
+
+						// Prefer matches that are closer to the end of currentLines
+						// (more recent content is more likely to be the right anchor)
+						if matchEnd > bestMatch {
+							bestMatch = matchEnd
+							bestMatchPos = savedIdx + seqLen
+							logDebug("Found %d-line sequence from savedLines[%d-%d] at currentLines[%d-%d]",
+								seqLen, savedIdx, savedIdx+seqLen-1, currIdx, currIdx+seqLen-1)
+						}
+
+						// If we found a long sequence near the end, we can stop
+						if seqLen >= 5 && matchEnd >= len(currentLines)-5 {
+							found = true
+							break
+						}
+					}
+				}
+			}
+		}
+
+		if bestMatch > 0 {
+			divergeIdx = bestMatch
+			logDebug("Using best match at currentLines[%d], corresponding to savedLines[%d]",
+				bestMatch, bestMatchPos)
 		} else {
-			break
+			// Fallback: check for simple overlap from the start
+			minLen := len(*savedLines)
+			if len(currentLines) < minLen {
+				minLen = len(currentLines)
+			}
+
+			for i := 0; i < minLen; i++ {
+				if (*savedLines)[i] == currentLines[i] {
+					divergeIdx = i + 1
+				} else {
+					break
+				}
+			}
+
+			if divergeIdx > 0 {
+				logDebug("Using start-overlap strategy, divergeIdx=%d", divergeIdx)
+			}
 		}
 	}
 
@@ -207,7 +283,62 @@ func saveNewContent(emulator *vt.Emulator, file *os.File, savedLines *[]string, 
 	logDebug("saveNewContent called: commandLine=%q, divergeIdx=%d, newLines=%d, totalLines=%d",
 		commandLine, divergeIdx, newLinesCount, len(currentLines))
 
+	// Log first and last few lines of currentLines for debugging
+	logDebug("currentLines preview:")
+	for i := 0; i < len(currentLines) && i < 3; i++ {
+		logDebug("  currentLines[%d]: %q", i, currentLines[i])
+	}
+	if len(currentLines) > 3 {
+		logDebug("  ... (%d more lines)", len(currentLines)-6)
+	}
+	for i := maxInt(len(currentLines)-3, 3); i < len(currentLines); i++ {
+		logDebug("  currentLines[%d]: %q", i, currentLines[i])
+	}
+
+	// Log savedLines count
+	logDebug("savedLines has %d lines", len(*savedLines))
+
+	// Check if command line needs to be saved (regardless of divergeIdx)
+	cmdLineNeedsSave := false
+	cmdLineIdx := -1
+	if commandLine != "" {
+		logDebug("Looking for command line in currentLines: %q", commandLine)
+		// Find command line in currentLines
+		for i := len(currentLines) - 1; i >= 0; i-- {
+			if currentLines[i] == commandLine {
+				cmdLineIdx = i
+				logDebug("Found command line at currentLines[%d]", cmdLineIdx)
+				break
+			}
+		}
+
+		if cmdLineIdx < 0 {
+			logDebug("Command line NOT found in currentLines")
+		}
+
+		// If found, check if it's already saved with separator
+		if cmdLineIdx >= 0 {
+			cmdLineWithSep := commandLine + " ||||"
+			alreadySaved := false
+			for _, saved := range *savedLines {
+				if saved == cmdLineWithSep {
+					alreadySaved = true
+					logDebug("Command line already saved with separator in savedLines")
+					break
+				}
+			}
+
+			// Mark if it needs to be saved
+			if !alreadySaved {
+				cmdLineNeedsSave = true
+				logDebug("Command line at currentLines[%d] needs separator (not in savedLines)", cmdLineIdx)
+			}
+		}
+	}
+
 	// Save all new lines after the divergence point
+	savedCmdLine := false
+	logDebug("Saving lines from divergeIdx=%d to %d (inclusive)", divergeIdx, len(currentLines)-1)
 	for i := divergeIdx; i < len(currentLines); i++ {
 		lineToWrite := currentLines[i]
 
@@ -215,6 +346,7 @@ func saveNewContent(emulator *vt.Emulator, file *os.File, savedLines *[]string, 
 		if commandLine != "" && lineToWrite == commandLine {
 			lineToWrite += " ||||"
 			logDebug("  -> Adding separator to line %d (matched command line): %q", i, lineToWrite)
+			savedCmdLine = true
 		}
 
 		if _, err := file.WriteString(lineToWrite + "\n"); err != nil {
@@ -222,6 +354,38 @@ func saveNewContent(emulator *vt.Emulator, file *os.File, savedLines *[]string, 
 		}
 
 		logDebug("  -> Saved line %d: %q", i, lineToWrite)
+	}
+
+	logDebug("After loop: savedCmdLine=%v, cmdLineNeedsSave=%v, cmdLineIdx=%d", savedCmdLine, cmdLineNeedsSave, cmdLineIdx)
+
+	// If command line needs saving but wasn't saved in the loop above
+	// (because it's before divergeIdx), save it AND all output after it until divergeIdx
+	if cmdLineNeedsSave && !savedCmdLine {
+		cmdLineWithSep := commandLine + " ||||"
+		logDebug("Command line not yet saved (cmdLineIdx=%d < divergeIdx=%d), saving it and all output after it", cmdLineIdx, divergeIdx)
+
+		// Save command line with separator
+		if _, err := file.WriteString(cmdLineWithSep + "\n"); err != nil {
+			return fmt.Errorf("failed to write to session file: %w", err)
+		}
+		logDebug("  -> Saved command line with separator: %q", cmdLineWithSep)
+
+		// Save all lines between command line and divergeIdx (the output of the command)
+		for i := cmdLineIdx + 1; i < divergeIdx; i++ {
+			if _, err := file.WriteString(currentLines[i] + "\n"); err != nil {
+				return fmt.Errorf("failed to write to session file: %w", err)
+			}
+			logDebug("  -> Saved output line %d: %q", i, currentLines[i])
+		}
+
+		// Update savedLines to current state
+		*savedLines = currentLines
+
+		// Flush to disk
+		if err := file.Sync(); err != nil {
+			return fmt.Errorf("failed to sync session file: %w", err)
+		}
+		return nil
 	}
 
 	// Update saved lines to current screen state
