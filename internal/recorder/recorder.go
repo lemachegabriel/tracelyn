@@ -161,35 +161,6 @@ func extractLine(emulator *vt.Emulator, y int) string {
 	return trimRight(line)
 }
 
-// Debug log file (package-level variable)
-var debugLogFile *os.File
-
-// initDebugLog initializes the debug log file
-func initDebugLog() error {
-	dir, err := getTracelynDir()
-	if err != nil {
-		return err
-	}
-
-	logPath := filepath.Join(dir, "debug.log")
-	debugLogFile, err = os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		return fmt.Errorf("failed to create debug log: %w", err)
-	}
-
-	// Write timestamp header
-	fmt.Fprintf(debugLogFile, "\n\n=== Recording session started at %s ===\n", time.Now().Format("2006-01-02 15:04:05"))
-	return nil
-}
-
-// logDebug writes to debug log file
-func logDebug(format string, args ...interface{}) {
-	if debugLogFile != nil {
-		fmt.Fprintf(debugLogFile, format+"\n", args...)
-		debugLogFile.Sync()
-	}
-}
-
 // saveNewContent extracts and saves only new lines from the virtual terminal
 // Compares line-by-line with previous screen state (allows repeated outputs)
 // commandLine is the line content that should receive the separator (captured when Enter was pressed)
@@ -222,7 +193,6 @@ func saveNewContent(emulator *vt.Emulator, file *os.File, savedLines *[]string, 
 
 		found := false
 		bestMatch := 0
-		bestMatchPos := 0
 
 		// Try progressively smaller sequence lengths
 		for seqLen := maxSequenceLen; seqLen >= minSequenceLen && !found; seqLen-- {
@@ -250,9 +220,6 @@ func saveNewContent(emulator *vt.Emulator, file *os.File, savedLines *[]string, 
 						// (more recent content is more likely to be the right anchor)
 						if matchEnd > bestMatch {
 							bestMatch = matchEnd
-							bestMatchPos = savedIdx + seqLen
-							logDebug("Found %d-line sequence from savedLines[%d-%d] at currentLines[%d-%d]",
-								seqLen, savedIdx, savedIdx+seqLen-1, currIdx, currIdx+seqLen-1)
 						}
 
 						// If we found a long sequence near the end, we can stop
@@ -267,8 +234,6 @@ func saveNewContent(emulator *vt.Emulator, file *os.File, savedLines *[]string, 
 
 		if bestMatch > 0 {
 			divergeIdx = bestMatch
-			logDebug("Using best match at currentLines[%d], corresponding to savedLines[%d]",
-				bestMatch, bestMatchPos)
 		} else {
 			// Fallback: check for simple overlap from the start
 			minLen := len(*savedLines)
@@ -283,49 +248,19 @@ func saveNewContent(emulator *vt.Emulator, file *os.File, savedLines *[]string, 
 					break
 				}
 			}
-
-			if divergeIdx > 0 {
-				logDebug("Using start-overlap strategy, divergeIdx=%d", divergeIdx)
-			}
 		}
 	}
-
-	// Debug logging
-	newLinesCount := len(currentLines) - divergeIdx
-	logDebug("saveNewContent called: commandLine=%q, divergeIdx=%d, newLines=%d, totalLines=%d",
-		commandLine, divergeIdx, newLinesCount, len(currentLines))
-
-	// Log first and last few lines of currentLines for debugging
-	logDebug("currentLines preview:")
-	for i := 0; i < len(currentLines) && i < 3; i++ {
-		logDebug("  currentLines[%d]: %q", i, currentLines[i])
-	}
-	if len(currentLines) > 3 {
-		logDebug("  ... (%d more lines)", len(currentLines)-6)
-	}
-	for i := maxInt(len(currentLines)-3, 3); i < len(currentLines); i++ {
-		logDebug("  currentLines[%d]: %q", i, currentLines[i])
-	}
-
-	// Log savedLines count
-	logDebug("savedLines has %d lines", len(*savedLines))
 
 	// Check if command line needs to be saved (regardless of divergeIdx)
 	cmdLineNeedsSave := false
 	cmdLineIdx := -1
 	if commandLine != "" {
-		logDebug("Looking for command line in currentLines: %q", commandLine)
 		// Find command line in currentLines
 		for i := len(currentLines) - 1; i >= 0; i-- {
 			if currentLines[i] == commandLine {
 				cmdLineIdx = i
-				logDebug("Found command line at currentLines[%d]", cmdLineIdx)
 				break
 			}
-		}
-
-		if cmdLineIdx < 0 {
-			logDebug("Command line NOT found in currentLines")
 		}
 
 		// If found, check if it's already saved with separator
@@ -335,7 +270,6 @@ func saveNewContent(emulator *vt.Emulator, file *os.File, savedLines *[]string, 
 			for _, saved := range *savedLines {
 				if saved == cmdLineWithSep {
 					alreadySaved = true
-					logDebug("Command line already saved with separator in savedLines")
 					break
 				}
 			}
@@ -343,51 +277,41 @@ func saveNewContent(emulator *vt.Emulator, file *os.File, savedLines *[]string, 
 			// Mark if it needs to be saved
 			if !alreadySaved {
 				cmdLineNeedsSave = true
-				logDebug("Command line at currentLines[%d] needs separator (not in savedLines)", cmdLineIdx)
 			}
 		}
 	}
 
 	// Save all new lines after the divergence point
 	savedCmdLine := false
-	logDebug("Saving lines from divergeIdx=%d to %d (inclusive)", divergeIdx, len(currentLines)-1)
 	for i := divergeIdx; i < len(currentLines); i++ {
 		lineToWrite := currentLines[i]
 
 		// Add separator if this line matches the command line (the line where Enter was pressed)
 		if commandLine != "" && lineToWrite == commandLine {
 			lineToWrite += " ||||"
-			logDebug("  -> Adding separator to line %d (matched command line): %q", i, lineToWrite)
 			savedCmdLine = true
 		}
 
 		if _, err := file.WriteString(lineToWrite + "\n"); err != nil {
 			return fmt.Errorf("failed to write to session file: %w", err)
 		}
-
-		logDebug("  -> Saved line %d: %q", i, lineToWrite)
 	}
-
-	logDebug("After loop: savedCmdLine=%v, cmdLineNeedsSave=%v, cmdLineIdx=%d", savedCmdLine, cmdLineNeedsSave, cmdLineIdx)
 
 	// If command line needs saving but wasn't saved in the loop above
 	// (because it's before divergeIdx), save it AND all output after it until divergeIdx
 	if cmdLineNeedsSave && !savedCmdLine {
 		cmdLineWithSep := commandLine + " ||||"
-		logDebug("Command line not yet saved (cmdLineIdx=%d < divergeIdx=%d), saving it and all output after it", cmdLineIdx, divergeIdx)
 
 		// Save command line with separator
 		if _, err := file.WriteString(cmdLineWithSep + "\n"); err != nil {
 			return fmt.Errorf("failed to write to session file: %w", err)
 		}
-		logDebug("  -> Saved command line with separator: %q", cmdLineWithSep)
 
 		// Save all lines between command line and divergeIdx (the output of the command)
 		for i := cmdLineIdx + 1; i < divergeIdx; i++ {
 			if _, err := file.WriteString(currentLines[i] + "\n"); err != nil {
 				return fmt.Errorf("failed to write to session file: %w", err)
 			}
-			logDebug("  -> Saved output line %d: %q", i, currentLines[i])
 		}
 
 		// Update savedLines to current state
@@ -469,8 +393,6 @@ func SetupIOCopy(ptmx *os.File, sessionFile *os.File) (onResize func(int, int), 
 	bufferHeight := height * 100  // 100x terminal height (e.g., 60 lines × 100 = 6000 lines buffer)
 	emulator = vt.NewEmulator(width, bufferHeight)
 
-	logDebug("Created emulator with size %dx%d (terminal is %dx%d)", width, bufferHeight, width, height)
-
 	// Track saved lines (protected by mutex for goroutine safety)
 	var stateMutex sync.Mutex
 	var savedLines []string
@@ -481,8 +403,6 @@ func SetupIOCopy(ptmx *os.File, sessionFile *os.File) (onResize func(int, int), 
 		stateMutex.Lock()
 		defer stateMutex.Unlock()
 
-		logDebug("Terminal resized from %dx%d to %dx%d, recreating emulator", width, height, newWidth, newHeight)
-
 		// Recreate emulator with new size (100x buffer height)
 		newBufferHeight := newHeight * 100
 		emulator = vt.NewEmulator(newWidth, newBufferHeight)
@@ -490,8 +410,6 @@ func SetupIOCopy(ptmx *os.File, sessionFile *os.File) (onResize func(int, int), 
 
 		// Clear saved lines to avoid mismatches with new screen size
 		savedLines = []string{}
-
-		logDebug("Emulator recreated with size %dx%d (terminal is %dx%d), savedLines cleared", newWidth, newBufferHeight, newWidth, newHeight)
 	}
 
 	// Goroutine 1: Read from PTY → write to stdout + feed emulator + detect fullscreen apps
@@ -564,13 +482,11 @@ func SetupIOCopy(ptmx *os.File, sessionFile *os.File) (onResize func(int, int), 
 						stateMutex.Lock()
 						cursorPos := emulator.CursorPosition()
 						commandLine := extractLine(emulator, cursorPos.Y)
-						logDebug("Enter detected at cursor Y=%d, captured command line: %q", cursorPos.Y, commandLine)
 
 						// Check if this is the same as the last saved line (empty Enter on prompt)
 						// If so, skip saving to avoid duplicates
 						isEmptyEnter := len(savedLines) > 0 && commandLine == savedLines[len(savedLines)-1]
 						if isEmptyEnter {
-							logDebug("  -> Skipping save: empty Enter (commandLine matches last saved line)")
 							stateMutex.Unlock()
 							break
 						}
@@ -580,11 +496,7 @@ func SetupIOCopy(ptmx *os.File, sessionFile *os.File) (onResize func(int, int), 
 						time.Sleep(50 * time.Millisecond)
 
 						stateMutex.Lock()
-						logDebug("Saving content after 50ms delay")
-						saveErr := saveNewContent(emulator, sessionFile, &savedLines, commandLine)
-						if saveErr != nil {
-							logDebug("Error saving: %v", saveErr)
-						}
+						saveNewContent(emulator, sessionFile, &savedLines, commandLine)
 
 						stateMutex.Unlock()
 						break
@@ -607,16 +519,6 @@ func HandleShutdownSignals() chan os.Signal {
 
 // StartRecording starts a new recording session
 func StartRecording() error {
-	// Initialize debug logging
-	if err := initDebugLog(); err != nil {
-		return err
-	}
-	defer func() {
-		if debugLogFile != nil {
-			debugLogFile.Close()
-		}
-	}()
-
 	// Load session registry
 	registry, err := LoadSessions()
 	if err != nil {
