@@ -106,7 +106,8 @@ func ConfigureTerminal(ptmx *os.File) (*term.State, error) {
 
 // HandleResize listens for SIGWINCH (window resize) signals and updates the PTY size accordingly
 // Returns the signal channel for cleanup
-func HandleResize(ptmx *os.File) chan os.Signal {
+// Also accepts a callback to recreate the emulator with the new size
+func HandleResize(ptmx *os.File, onResize func(width, height int)) chan os.Signal {
 	// Create channel to receive window resize signals
 	resizeCh := make(chan os.Signal, 1)
 	signal.Notify(resizeCh, syscall.SIGWINCH)
@@ -120,20 +121,30 @@ func HandleResize(ptmx *os.File) chan os.Signal {
 				// The terminal will continue working, just with the old size
 				continue
 			}
+
+			// Get new terminal size
+			width, height, err := term.GetSize(int(os.Stdin.Fd()))
+			if err != nil {
+				continue // Keep old size if we can't read new one
+			}
+
+			// Call callback to recreate emulator with new size
+			if onResize != nil {
+				onResize(width, height)
+			}
 		}
 	}()
 
 	return resizeCh
 }
 
-// captureState represents the current state of the recording session
-type captureState int
-
-const (
-	waitingForEnter  captureState = iota // Waiting for user to press Enter
-	waitingForOutput                     // Waiting for command output to complete
-	paused                               // Paused during fullscreen apps (vim, less, etc)
-)
+// maxInt returns the maximum of two integers
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
 
 // extractLine gets a single line from the emulator, trimmed
 func extractLine(emulator *vt.Emulator, y int) string {
@@ -152,7 +163,8 @@ func extractLine(emulator *vt.Emulator, y int) string {
 
 // saveNewContent extracts and saves only new lines from the virtual terminal
 // Compares line-by-line with previous screen state (allows repeated outputs)
-func saveNewContent(emulator *vt.Emulator, file *os.File, savedLines *[]string) error {
+// commandLine is the line content that should receive the separator (captured when Enter was pressed)
+func saveNewContent(emulator *vt.Emulator, file *os.File, savedLines *[]string, commandLine string) error {
 	height := emulator.Height()
 	var currentLines []string
 
@@ -164,28 +176,152 @@ func saveNewContent(emulator *vt.Emulator, file *os.File, savedLines *[]string) 
 		}
 	}
 
-	// Find the minimum common prefix between current and saved lines
-	// This handles terminal scrolling and new content appearing
-	minLen := len(*savedLines)
-	if len(currentLines) < minLen {
-		minLen = len(currentLines)
+	// Find where to start saving from currentLines
+	divergeIdx := 0
+
+	// Strategy: Find any sequence from savedLines that appears in currentLines
+	// Search from end of savedLines backwards (more recent = more likely to be visible)
+	// This handles terminal scrolling where old content scrolls out of view
+	if len(*savedLines) > 0 && len(currentLines) > 0 {
+		// Try to find overlap by searching for sequences of lines
+		// Start with longer sequences (more reliable) and work down to 3 lines minimum
+		maxSequenceLen := 10
+		minSequenceLen := 3
+		if len(*savedLines) < maxSequenceLen {
+			maxSequenceLen = len(*savedLines)
+		}
+
+		found := false
+		bestMatch := 0
+
+		// Try progressively smaller sequence lengths
+		for seqLen := maxSequenceLen; seqLen >= minSequenceLen && !found; seqLen-- {
+			// Search for sequences from savedLines (start from end, go backwards)
+			for savedIdx := len(*savedLines) - seqLen; savedIdx >= 0 && !found; savedIdx-- {
+				savedSequence := (*savedLines)[savedIdx : savedIdx+seqLen]
+
+				// Search for this sequence anywhere in currentLines
+				for currIdx := 0; currIdx <= len(currentLines)-seqLen; currIdx++ {
+					// Check if sequence matches at position currIdx
+					matches := true
+					for j := 0; j < seqLen; j++ {
+						if currentLines[currIdx+j] != savedSequence[j] {
+							matches = false
+							break
+						}
+					}
+
+					if matches {
+						// Found a sequence match!
+						// Position after this sequence in currentLines
+						matchEnd := currIdx + seqLen
+
+						// Prefer matches that are closer to the end of currentLines
+						// (more recent content is more likely to be the right anchor)
+						if matchEnd > bestMatch {
+							bestMatch = matchEnd
+						}
+
+						// If we found a long sequence near the end, we can stop
+						if seqLen >= 5 && matchEnd >= len(currentLines)-5 {
+							found = true
+							break
+						}
+					}
+				}
+			}
+		}
+
+		if bestMatch > 0 {
+			divergeIdx = bestMatch
+		} else {
+			// Fallback: check for simple overlap from the start
+			minLen := len(*savedLines)
+			if len(currentLines) < minLen {
+				minLen = len(currentLines)
+			}
+
+			for i := 0; i < minLen; i++ {
+				if (*savedLines)[i] == currentLines[i] {
+					divergeIdx = i + 1
+				} else {
+					break
+				}
+			}
+		}
 	}
 
-	// Find where the content diverges
-	divergeIdx := 0
-	for i := 0; i < minLen; i++ {
-		if (*savedLines)[i] == currentLines[i] {
-			divergeIdx = i + 1
-		} else {
-			break
+	// Check if command line needs to be saved (regardless of divergeIdx)
+	cmdLineNeedsSave := false
+	cmdLineIdx := -1
+	if commandLine != "" {
+		// Find command line in currentLines
+		for i := len(currentLines) - 1; i >= 0; i-- {
+			if currentLines[i] == commandLine {
+				cmdLineIdx = i
+				break
+			}
+		}
+
+		// If found, check if it's already saved with separator
+		if cmdLineIdx >= 0 {
+			cmdLineWithSep := commandLine + " ||||"
+			alreadySaved := false
+			for _, saved := range *savedLines {
+				if saved == cmdLineWithSep {
+					alreadySaved = true
+					break
+				}
+			}
+
+			// Mark if it needs to be saved
+			if !alreadySaved {
+				cmdLineNeedsSave = true
+			}
 		}
 	}
 
 	// Save all new lines after the divergence point
+	savedCmdLine := false
 	for i := divergeIdx; i < len(currentLines); i++ {
-		if _, err := file.WriteString(currentLines[i] + "\n"); err != nil {
+		lineToWrite := currentLines[i]
+
+		// Add separator if this line matches the command line (the line where Enter was pressed)
+		if commandLine != "" && lineToWrite == commandLine {
+			lineToWrite += " ||||"
+			savedCmdLine = true
+		}
+
+		if _, err := file.WriteString(lineToWrite + "\n"); err != nil {
 			return fmt.Errorf("failed to write to session file: %w", err)
 		}
+	}
+
+	// If command line needs saving but wasn't saved in the loop above
+	// (because it's before divergeIdx), save it AND all output after it until divergeIdx
+	if cmdLineNeedsSave && !savedCmdLine {
+		cmdLineWithSep := commandLine + " ||||"
+
+		// Save command line with separator
+		if _, err := file.WriteString(cmdLineWithSep + "\n"); err != nil {
+			return fmt.Errorf("failed to write to session file: %w", err)
+		}
+
+		// Save all lines between command line and divergeIdx (the output of the command)
+		for i := cmdLineIdx + 1; i < divergeIdx; i++ {
+			if _, err := file.WriteString(currentLines[i] + "\n"); err != nil {
+				return fmt.Errorf("failed to write to session file: %w", err)
+			}
+		}
+
+		// Update savedLines to current state
+		*savedLines = currentLines
+
+		// Flush to disk
+		if err := file.Sync(); err != nil {
+			return fmt.Errorf("failed to sync session file: %w", err)
+		}
+		return nil
 	}
 
 	// Update saved lines to current screen state
@@ -242,7 +378,8 @@ func containsSequence(s, seq string) bool {
 // SetupIOCopy sets up bidirectional I/O copying between the terminal and PTY
 // with Enter-based saving: only saves content when Enter is pressed
 // Automatically pauses recording when fullscreen apps (vim, less) are detected
-func SetupIOCopy(ptmx *os.File, sessionFile *os.File) error {
+// Returns a function that should be called when terminal is resized
+func SetupIOCopy(ptmx *os.File, sessionFile *os.File) (onResize func(int, int), err error) {
 	// Get current terminal size for virtual terminal
 	width, height, err := term.GetSize(int(os.Stdin.Fd()))
 	if err != nil {
@@ -250,13 +387,30 @@ func SetupIOCopy(ptmx *os.File, sessionFile *os.File) error {
 		width, height = 80, 24
 	}
 
-	// Create virtual terminal emulator
-	emulator := vt.NewEmulator(width, height)
+	// Create virtual terminal emulator with MUCH larger buffer to capture all output
+	// Even if output is longer than terminal height, we keep it in the buffer
+	var emulator *vt.Emulator
+	bufferHeight := height * 100  // 100x terminal height (e.g., 60 lines × 100 = 6000 lines buffer)
+	emulator = vt.NewEmulator(width, bufferHeight)
 
-	// Track state and saved lines (protected by mutex for goroutine safety)
+	// Track saved lines (protected by mutex for goroutine safety)
 	var stateMutex sync.Mutex
-	state := waitingForEnter
 	var savedLines []string
+	var paused bool
+
+	// Create resize callback that recreates emulator with new size
+	onResize = func(newWidth, newHeight int) {
+		stateMutex.Lock()
+		defer stateMutex.Unlock()
+
+		// Recreate emulator with new size (100x buffer height)
+		newBufferHeight := newHeight * 100
+		emulator = vt.NewEmulator(newWidth, newBufferHeight)
+		width, height = newWidth, newHeight
+
+		// Clear saved lines to avoid mismatches with new screen size
+		savedLines = []string{}
+	}
 
 	// Goroutine 1: Read from PTY → write to stdout + feed emulator + detect fullscreen apps
 	go func() {
@@ -274,21 +428,21 @@ func SetupIOCopy(ptmx *os.File, sessionFile *os.File) error {
 				if enterScreen {
 					// Entering fullscreen app → pause recording
 					fmt.Fprintf(os.Stderr, "\r\n[tracelyn] Fullscreen app detected - recording paused (nothing will be saved)\r\n")
-					state = paused
+					paused = true
 				} else if exitScreen {
 					// Exiting fullscreen app → resume recording
 					fmt.Fprintf(os.Stderr, "\r\n[tracelyn] Recording resumed - fullscreen app session was not recorded\r\n")
-					state = waitingForEnter
+					paused = false
 					// Clear emulator to avoid capturing leftover screen data
 					emulator = vt.NewEmulator(width, height)
 					savedLines = []string{}
 				}
 
 				// Only feed to emulator when NOT paused
-				currentState := state
+				isPaused := paused
 				stateMutex.Unlock()
 
-				if currentState != paused {
+				if !isPaused {
 					emulator.Write(buf[:n])
 				}
 			}
@@ -313,36 +467,36 @@ func SetupIOCopy(ptmx *os.File, sessionFile *os.File) error {
 
 				// Check if paused (in fullscreen app)
 				stateMutex.Lock()
-				currentState := state
+				isPaused := paused
 				stateMutex.Unlock()
 
-				if currentState == paused {
+				if isPaused {
 					continue
 				}
 
 				// Only save when Enter is pressed
 				for i := 0; i < n; i++ {
 					if buf[i] == '\r' || buf[i] == '\n' {
+						// Capture the command line BEFORE any output appears
+						// Get cursor position to know which line contains the command
+						stateMutex.Lock()
+						cursorPos := emulator.CursorPosition()
+						commandLine := extractLine(emulator, cursorPos.Y)
+
+						// Check if this is the same as the last saved line (empty Enter on prompt)
+						// If so, skip saving to avoid duplicates
+						isEmptyEnter := len(savedLines) > 0 && commandLine == savedLines[len(savedLines)-1]
+						if isEmptyEnter {
+							stateMutex.Unlock()
+							break
+						}
+						stateMutex.Unlock()
+
 						// Wait for shell to process the command and update screen
 						time.Sleep(50 * time.Millisecond)
 
 						stateMutex.Lock()
-
-						if state == waitingForEnter {
-							// Save command line that was just entered
-							saveErr := saveNewContent(emulator, sessionFile, &savedLines)
-							if saveErr != nil {
-								// Silently handle errors
-							}
-							state = waitingForOutput
-						} else if state == waitingForOutput {
-							// Save command output
-							saveErr := saveNewContent(emulator, sessionFile, &savedLines)
-							if saveErr != nil {
-								// Silently handle errors
-							}
-							state = waitingForEnter
-						}
+						saveNewContent(emulator, sessionFile, &savedLines, commandLine)
 
 						stateMutex.Unlock()
 						break
@@ -352,7 +506,7 @@ func SetupIOCopy(ptmx *os.File, sessionFile *os.File) error {
 		}
 	}()
 
-	return nil
+	return onResize, nil
 }
 
 // HandleShutdownSignals sets up signal handlers for graceful shutdown
@@ -422,18 +576,19 @@ func StartRecording() error {
 	}
 	defer term.Restore(int(os.Stdin.Fd()), oldState)
 
-	// Handle window resize
-	resizeCh := HandleResize(ptmx)
+	// Setup I/O copy with recording (returns resize callback)
+	onResize, err := SetupIOCopy(ptmx, sessionFile)
+	if err != nil {
+		return err
+	}
+
+	// Handle window resize (pass resize callback from SetupIOCopy)
+	resizeCh := HandleResize(ptmx, onResize)
 	defer signal.Stop(resizeCh)
 
 	// Handle shutdown signals (SIGTERM, SIGINT)
 	sigChan := HandleShutdownSignals()
 	defer signal.Stop(sigChan)
-
-	// Setup I/O copy with recording
-	if err := SetupIOCopy(ptmx, sessionFile); err != nil {
-		return err
-	}
 
 	// Wait for shell to exit or shutdown signal
 	done := make(chan error, 1)
